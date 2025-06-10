@@ -1,6 +1,8 @@
 from diffusers_helper.hf_login import login
 
 import os
+import glob
+from datetime import datetime
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -373,6 +375,48 @@ def end_process():
     stream.input_queue.push('end')
 
 
+def get_output_videos():
+    """获取输出文件夹中的所有MP4文件"""
+    mp4_files = glob.glob(os.path.join(outputs_folder, "*.mp4"))
+    if not mp4_files:
+        return (
+            "没有找到任何视频文件", 
+            gr.update(choices=[], value=None, visible=False), 
+            gr.update(visible=False),  # preview_btn
+            gr.update(visible=False),  # download_btn
+            gr.update(visible=False)   # preview_video
+        )
+    
+    # 按修改时间排序，最新的在前
+    mp4_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    
+    # 创建文件信息列表
+    file_info = []
+    file_choices = []
+    for file_path in mp4_files:
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+        mod_time = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M:%S")
+        file_info.append(f"📹 {filename} ({file_size:.1f}MB) - {mod_time}")
+        file_choices.append(file_path)
+    
+    file_list_text = "\n".join(file_info)
+    return (
+        file_list_text, 
+        gr.update(choices=file_choices, value=file_choices[0] if file_choices else None, visible=True), 
+        gr.update(visible=True),   # preview_btn
+        gr.update(visible=True),   # download_btn
+        gr.update(visible=False)   # preview_video (隐藏直到用户点击预览)
+    )
+
+
+def download_selected_video(selected_file):
+    """处理视频文件下载"""
+    if selected_file is None:
+        return None, gr.update(visible=False)
+    return selected_file, gr.update(visible=True)
+
+
 quick_prompts = [
     'The girl dances gracefully, with clear movements, full of charm.',
     'A character doing some simple body movements.',
@@ -424,12 +468,60 @@ with block:
             result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+            
+            # 视频文件管理区域
+            with gr.Group():
+                gr.Markdown("### 📁 输出视频管理")
+                with gr.Row():
+                    refresh_btn = gr.Button("🔄 刷新列表", size="sm")
+                
+                video_list_display = gr.Textbox(
+                    label="视频文件列表", 
+                    lines=6, 
+                    interactive=False,
+                    placeholder="点击刷新按钮查看视频文件..."
+                )
+                
+                with gr.Row():
+                    video_selector = gr.Dropdown(
+                        label="选择视频",
+                        choices=[],
+                        visible=False
+                    )
+                
+                with gr.Row():
+                    preview_btn = gr.Button("👁️ 预览", size="sm", visible=False)
+                    download_btn = gr.Button("⬇️ 下载", size="sm", visible=False)
+                
+                preview_video = gr.Video(label="视频预览", visible=False, height=300)
+                download_file = gr.File(label="下载", visible=False)
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
+    
+    # 视频文件管理事件处理
+    refresh_btn.click(
+        fn=get_output_videos,
+        outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
+    )
+    
+    preview_btn.click(
+        fn=lambda x: x,
+        inputs=[video_selector],
+        outputs=[preview_video]
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        outputs=[preview_video]
+    )
+    
+    download_btn.click(
+        fn=download_selected_video,
+        inputs=[video_selector],
+        outputs=[download_file, download_file]
+    )
 
 
 block.launch(
