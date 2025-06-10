@@ -15,6 +15,7 @@ import argparse
 import math
 import gc
 import time
+import glob
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -373,6 +374,28 @@ def end_process():
     stream.input_queue.push('end')
 
 
+def list_mp4_files():
+    # 使用絕對路徑
+    mp4_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
+    print(f"搜尋 MP4 檔案的目錄: {mp4_dir}")
+
+    # 確保目錄存在
+    if not os.path.exists(mp4_dir):
+        print(f"警告: outputs 目錄不存在，建立中...")
+        os.makedirs(mp4_dir, exist_ok=True)
+
+    files = glob.glob(os.path.join(mp4_dir, '*.mp4'))
+    print(f"找到的 MP4 檔案: {files}")
+
+    # 確保列表不為空，否則會導致下拉選單出錯
+    if not files:
+        print("沒有找到 MP4 檔案")
+        return []
+
+    # 直接返回檔案路徑列表
+    return files
+
+
 quick_prompts = [
     'The girl dances gracefully, with clear movements, full of charm.',
     'A character doing some simple body movements.',
@@ -426,6 +449,30 @@ with block:
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
+
+    # 新增 outputs mp4 檔案瀏覽與下載區塊
+    with gr.Group():
+        gr.Markdown('### 下載 outputs 目錄下的 MP4 影片')
+        with gr.Row():
+            mp4_files = gr.Dropdown(choices=list_mp4_files(), label="選擇 MP4 影片下載", interactive=True)
+            refresh_btn = gr.Button(value="🔄 刷新檔案列表")
+
+        download_file = gr.File(label="下載選擇的影片", interactive=True, file_count="single")
+
+        def get_file_for_download(selected):
+            print(f"選擇下載的檔案: {selected}")
+            return selected if selected else None
+
+        def refresh_mp4_list():
+            files = list_mp4_files()
+            # 新版 Gradio 不再使用 update 方法
+            return files
+
+        mp4_files.change(get_file_for_download, inputs=mp4_files, outputs=download_file)
+        refresh_btn.click(refresh_mp4_list, outputs=mp4_files)
+
+        # 啟動時自動更新一次
+        block.load(refresh_mp4_list, outputs=mp4_files)
 
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
