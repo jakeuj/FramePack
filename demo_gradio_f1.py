@@ -421,6 +421,140 @@ def get_output_videos():
     )
 
 
+def parse_video_filename(filename):
+    """解析视频文件名，提取任务ID和帧数信息"""
+    try:
+        # 移除.mp4扩展名
+        name_without_ext = filename.replace('.mp4', '')
+        # 分割文件名，格式假设为: timestamp_jobid_framecount
+        parts = name_without_ext.split('_')
+        if len(parts) >= 3:
+            # 最后一个数字是帧数
+            frame_count = int(parts[-1])
+            # 前面的部分是任务标识符
+            job_id = '_'.join(parts[:-1])
+            return job_id, frame_count
+        return None, None
+    except:
+        return None, None
+
+
+def get_cleanup_preview():
+    """获取清理预览信息"""
+    mp4_files = glob.glob(os.path.join(outputs_folder, "*.mp4"))
+    if not mp4_files:
+        return "没有找到任何视频文件", gr.update(visible=False)
+    
+    # 按任务分组
+    job_groups = {}
+    for file_path in mp4_files:
+        filename = os.path.basename(file_path)
+        job_id, frame_count = parse_video_filename(filename)
+        
+        if job_id and frame_count is not None:
+            if job_id not in job_groups:
+                job_groups[job_id] = []
+            job_groups[job_id].append((file_path, frame_count, filename))
+    
+    if not job_groups:
+        return "没有找到有效的视频文件", gr.update(visible=False)
+    
+    # 生成清理预览
+    preview_info = []
+    total_to_delete = 0
+    total_size_to_free = 0
+    
+    for job_id, files in job_groups.items():
+        if len(files) <= 1:
+            continue  # 只有一个文件的任务不需要清理
+        
+        # 按帧数排序，帧数最大的是最新最长的
+        files.sort(key=lambda x: x[1], reverse=True)
+        latest_file = files[0]
+        files_to_delete = files[1:]
+        
+        preview_info.append(f"📂 任务: {job_id}")
+        preview_info.append(f"  ✅ 保留: {latest_file[2]} ({latest_file[1]} 帧)")
+        
+        for file_path, frame_count, filename in files_to_delete:
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+            preview_info.append(f"  ❌ 删除: {filename} ({frame_count} 帧, {file_size:.1f}MB)")
+            total_to_delete += 1
+            total_size_to_free += file_size
+        
+        preview_info.append("")  # 空行分隔
+    
+    if total_to_delete == 0:
+        return "没有需要清理的文件（每个任务都只有一个视频文件）", gr.update(visible=False)
+    
+    summary = f"总计将删除 {total_to_delete} 个文件，释放约 {total_size_to_free:.1f}MB 空间\n\n"
+    preview_text = summary + "\n".join(preview_info)
+    
+    return preview_text, gr.update(visible=True)
+
+
+def cleanup_videos():
+    """执行视频清理"""
+    mp4_files = glob.glob(os.path.join(outputs_folder, "*.mp4"))
+    if not mp4_files:
+        return "没有找到任何视频文件", "❌ 清理失败"
+    
+    # 按任务分组
+    job_groups = {}
+    for file_path in mp4_files:
+        filename = os.path.basename(file_path)
+        job_id, frame_count = parse_video_filename(filename)
+        
+        if job_id and frame_count is not None:
+            if job_id not in job_groups:
+                job_groups[job_id] = []
+            job_groups[job_id].append((file_path, frame_count, filename))
+    
+    if not job_groups:
+        return "没有找到有效的视频文件", "❌ 清理失败"
+    
+    # 执行清理
+    deleted_count = 0
+    deleted_size = 0
+    result_info = []
+    
+    try:
+        for job_id, files in job_groups.items():
+            if len(files) <= 1:
+                continue  # 只有一个文件的任务不需要清理
+            
+            # 按帧数排序，帧数最大的是最新最长的
+            files.sort(key=lambda x: x[1], reverse=True)
+            latest_file = files[0]
+            files_to_delete = files[1:]
+            
+            result_info.append(f"📂 任务: {job_id}")
+            result_info.append(f"  ✅ 保留: {latest_file[2]}")
+            
+            for file_path, frame_count, filename in files_to_delete:
+                try:
+                    file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                    os.remove(file_path)
+                    result_info.append(f"  ✅ 已删除: {filename} ({file_size:.1f}MB)")
+                    deleted_count += 1
+                    deleted_size += file_size
+                except Exception as e:
+                    result_info.append(f"  ❌ 删除失败: {filename} - {str(e)}")
+            
+            result_info.append("")  # 空行分隔
+        
+        if deleted_count == 0:
+            return "没有需要清理的文件", "ℹ️ 无需清理"
+        
+        summary = f"✅ 清理完成！共删除 {deleted_count} 个文件，释放了 {deleted_size:.1f}MB 空间\n\n"
+        result_text = summary + "\n".join(result_info)
+        
+        return result_text, "✅ 清理成功"
+        
+    except Exception as e:
+        return f"清理过程中发生错误: {str(e)}", "❌ 清理失败"
+
+
 def download_selected_video(selected_file):
     """处理视频文件下载"""
     if selected_file is None:
@@ -457,7 +591,7 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=120, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
@@ -483,8 +617,10 @@ with block:
             # 视频文件管理区域
             with gr.Group():
                 gr.Markdown("### 📁 输出视频管理")
+                gr.Markdown("💡 **清理功能说明**: 对于每个生成任务，只保留最长的视频文件，删除中间生成的较短文件以节省空间。")
                 with gr.Row():
                     refresh_btn = gr.Button("🔄 刷新列表", size="sm")
+                    cleanup_preview_btn = gr.Button("🗂️ 清理预览", size="sm")
                 
                 video_list_display = gr.Textbox(
                     label="视频文件列表", 
@@ -492,6 +628,18 @@ with block:
                     interactive=False,
                     placeholder="点击刷新按钮查看视频文件..."
                 )
+                
+                # 清理预览区域
+                cleanup_preview_display = gr.Textbox(
+                    label="清理预览", 
+                    lines=8, 
+                    interactive=False,
+                    visible=False,
+                    placeholder="点击清理预览按钮查看将要删除的文件..."
+                )
+                
+                cleanup_execute_btn = gr.Button("🗑️ 执行清理", variant="stop", size="sm", visible=False)
+                cleanup_status = gr.Textbox(label="清理状态", visible=False, interactive=False)
                 
                 with gr.Row():
                     video_selector = gr.Dropdown(
@@ -516,6 +664,24 @@ with block:
     # 视频文件管理事件处理
     refresh_btn.click(
         fn=get_output_videos,
+        outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
+    )
+    
+    # 清理预览事件
+    cleanup_preview_btn.click(
+        fn=get_cleanup_preview,
+        outputs=[cleanup_preview_display, cleanup_execute_btn]
+    )
+    
+    # 执行清理事件
+    cleanup_execute_btn.click(
+        fn=cleanup_videos,
+        outputs=[cleanup_preview_display, cleanup_status]
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        outputs=[cleanup_status]
+    ).then(
+        fn=get_output_videos,  # 清理后自动刷新文件列表
         outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
     )
     
