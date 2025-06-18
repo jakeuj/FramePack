@@ -40,12 +40,23 @@ parser.add_argument("--server", type=str, default='0.0.0.0')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--output_dir", type=str, default='./outputs')
+parser.add_argument("--username", type=str, default='admin', help='认证用户名 (默认: admin)')
+parser.add_argument("--password", type=str, default='123456', help='认证密码 (默认: 123456)')
+parser.add_argument("--no-auth", action='store_true', help='禁用认证')
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
 # For linux server probably use --server 127.0.0.1 or do not use any cmd flags
 
 print(args)
+
+# 设置认证
+auth_settings = None
+if not args.no_auth:
+    auth_settings = (args.username, args.password)
+    print(f'启用认证 - 用户名: {args.username}, 密码: {"*" * len(args.password)}')
+else:
+    print('认证已禁用')
 
 if torch.cuda.is_available():
     free_mem_gb = get_cuda_free_memory_gb(gpu)
@@ -530,4 +541,5 @@ block.launch(
     share=args.share,
     inbrowser=args.inbrowser,
     allowed_paths=[outputs_folder],
+    auth=auth_settings,
 )
