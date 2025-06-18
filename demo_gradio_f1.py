@@ -555,6 +555,113 @@ def cleanup_videos():
         return f"清理过程中发生错误: {str(e)}", "❌ 清理失败"
 
 
+def get_all_files_preview():
+    """获取所有文件的删除预览"""
+    # 支持的文件类型
+    file_patterns = ["*.mp4", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.webp"]
+    
+    all_files = []
+    for pattern in file_patterns:
+        all_files.extend(glob.glob(os.path.join(outputs_folder, pattern)))
+    
+    if not all_files:
+        return "输出文件夹中没有找到任何文件", gr.update(visible=False)
+    
+    # 按文件类型分组统计
+    file_stats = {}
+    total_size = 0
+    
+    for file_path in all_files:
+        filename = os.path.basename(file_path)
+        file_ext = os.path.splitext(filename)[1].lower()
+        file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+        
+        if file_ext not in file_stats:
+            file_stats[file_ext] = {"count": 0, "size": 0, "files": []}
+        
+        file_stats[file_ext]["count"] += 1
+        file_stats[file_ext]["size"] += file_size
+        file_stats[file_ext]["files"].append((filename, file_size))
+        total_size += file_size
+    
+    # 生成预览信息
+    preview_info = []
+    preview_info.append("⚠️ 警告：此操作将删除输出文件夹中的所有文件！")
+    preview_info.append(f"📊 总计: {len(all_files)} 个文件，约 {total_size:.1f}MB")
+    preview_info.append("")
+    
+    for file_ext, stats in sorted(file_stats.items()):
+        preview_info.append(f"📄 {file_ext.upper() if file_ext else '无扩展名'} 文件: {stats['count']} 个，{stats['size']:.1f}MB")
+        
+        # 显示文件列表（如果文件太多只显示前10个）
+        files_to_show = stats['files'][:10]
+        for filename, file_size in files_to_show:
+            preview_info.append(f"   • {filename} ({file_size:.1f}MB)")
+        
+        if len(stats['files']) > 10:
+            preview_info.append(f"   ... 还有 {len(stats['files']) - 10} 个文件")
+        
+        preview_info.append("")
+    
+    preview_text = "\n".join(preview_info)
+    return preview_text, gr.update(visible=True)
+
+
+def delete_all_files():
+    """删除所有文件"""
+    # 支持的文件类型
+    file_patterns = ["*.mp4", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.webp"]
+    
+    all_files = []
+    for pattern in file_patterns:
+        all_files.extend(glob.glob(os.path.join(outputs_folder, pattern)))
+    
+    if not all_files:
+        return "输出文件夹中没有找到任何文件", "ℹ️ 无文件可删除"
+    
+    # 执行删除
+    deleted_count = 0
+    failed_count = 0
+    total_size_freed = 0
+    result_info = []
+    
+    try:
+        result_info.append("🗑️ 开始删除所有文件...")
+        result_info.append("")
+        
+        for file_path in all_files:
+            filename = os.path.basename(file_path)
+            try:
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                os.remove(file_path)
+                result_info.append(f"✅ 已删除: {filename} ({file_size:.1f}MB)")
+                deleted_count += 1
+                total_size_freed += file_size
+            except Exception as e:
+                result_info.append(f"❌ 删除失败: {filename} - {str(e)}")
+                failed_count += 1
+        
+        result_info.append("")
+        
+        if deleted_count > 0:
+            summary = f"✅ 删除完成！\n"
+            summary += f"• 成功删除: {deleted_count} 个文件\n"
+            if failed_count > 0:
+                summary += f"• 删除失败: {failed_count} 个文件\n"
+            summary += f"• 释放空间: {total_size_freed:.1f}MB\n\n"
+            
+            result_text = summary + "\n".join(result_info)
+            status = "✅ 删除完成"
+        else:
+            result_text = "❌ 没有成功删除任何文件\n\n" + "\n".join(result_info)
+            status = "❌ 删除失败"
+        
+        return result_text, status
+        
+    except Exception as e:
+        return f"删除过程中发生严重错误: {str(e)}", "❌ 删除失败"
+
+
 def download_selected_video(selected_file):
     """处理视频文件下载"""
     if selected_file is None:
@@ -617,10 +724,13 @@ with block:
             # 视频文件管理区域
             with gr.Group():
                 gr.Markdown("### 📁 输出视频管理")
-                gr.Markdown("💡 **清理功能说明**: 对于每个生成任务，只保留最长的视频文件，删除中间生成的较短文件以节省空间。")
+                gr.Markdown("💡 **清理功能说明**:")
+                gr.Markdown("• **智能清理**: 对于每个生成任务，只保留最长的视频文件，删除中间生成的较短文件")
+                gr.Markdown("• **全部删除**: ⚠️ 删除输出文件夹中的所有文件（MP4、PNG、JPG等），操作前请仔细确认")
                 with gr.Row():
                     refresh_btn = gr.Button("🔄 刷新列表", size="sm")
                     cleanup_preview_btn = gr.Button("🗂️ 清理预览", size="sm")
+                    delete_all_preview_btn = gr.Button("🗑️ 全部删除预览", variant="stop", size="sm")
                 
                 video_list_display = gr.Textbox(
                     label="视频文件列表", 
@@ -640,6 +750,21 @@ with block:
                 
                 cleanup_execute_btn = gr.Button("🗑️ 执行清理", variant="stop", size="sm", visible=False)
                 cleanup_status = gr.Textbox(label="清理状态", visible=False, interactive=False)
+                
+                # 全部删除区域
+                delete_all_preview_display = gr.Textbox(
+                    label="全部删除预览", 
+                    lines=10, 
+                    interactive=False,
+                    visible=False,
+                    placeholder="点击全部删除预览按钮查看将要删除的所有文件..."
+                )
+                
+                with gr.Row():
+                    delete_all_execute_btn = gr.Button("⚠️ 确认删除全部文件", variant="stop", size="sm", visible=False)
+                    delete_all_cancel_btn = gr.Button("❌ 取消", size="sm", visible=False)
+                
+                delete_all_status = gr.Textbox(label="删除状态", visible=False, interactive=False)
                 
                 with gr.Row():
                     video_selector = gr.Dropdown(
@@ -683,6 +808,33 @@ with block:
     ).then(
         fn=get_output_videos,  # 清理后自动刷新文件列表
         outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
+    )
+    
+    # 全部删除预览事件
+    delete_all_preview_btn.click(
+        fn=get_all_files_preview,
+        outputs=[delete_all_preview_display, delete_all_execute_btn]
+    ).then(
+        fn=lambda: [gr.update(visible=True), gr.update(visible=True)],
+        outputs=[delete_all_cancel_btn, delete_all_preview_display]
+    )
+    
+    # 执行全部删除事件
+    delete_all_execute_btn.click(
+        fn=delete_all_files,
+        outputs=[delete_all_preview_display, delete_all_status]
+    ).then(
+        fn=lambda: [gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)],
+        outputs=[delete_all_status, delete_all_execute_btn, delete_all_cancel_btn]
+    ).then(
+        fn=get_output_videos,  # 删除后自动刷新文件列表
+        outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
+    )
+    
+    # 取消全部删除事件
+    delete_all_cancel_btn.click(
+        fn=lambda: [gr.update(visible=False, value=""), gr.update(visible=False), gr.update(visible=False)],
+        outputs=[delete_all_preview_display, delete_all_execute_btn, delete_all_cancel_btn]
     )
     
     preview_btn.click(
