@@ -24,6 +24,7 @@ USERNAME="admin"
 PASSWORD="123456"
 DEFAULT_PORT=7860
 SECOND_PORT=7861
+HOST="0.0.0.0"  # 監聽所有網路介面，允許外部訪問
 
 # 系統配置
 PID_DIR="${WORK_DIR}/pids"
@@ -77,6 +78,40 @@ check_dependencies() {
     fi
 
     print_success "依賴檢查完成"
+}
+
+# 檢查網路設定
+check_network() {
+    print_info "檢查網路設定..."
+
+    if [[ "$HOST" == "0.0.0.0" ]]; then
+        # 獲取本機 IP 地址
+        local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null)
+        if [[ -n "$local_ip" ]]; then
+            print_success "本機 IP 地址: $local_ip"
+            print_info "外部設備可通過此 IP 訪問服務"
+        else
+            print_warning "無法獲取本機 IP 地址"
+        fi
+
+        # 檢查防火牆狀態
+        if command -v ufw >/dev/null 2>&1; then
+            if ufw status | grep -q "Status: active"; then
+                print_warning "UFW 防火牆已啟用，可能需要開放端口"
+                print_info "開放端口命令: sudo ufw allow $DEFAULT_PORT"
+                [[ "$ENABLE_SECOND_GPU" == "true" ]] && print_info "開放端口命令: sudo ufw allow $SECOND_PORT"
+            fi
+        fi
+
+        # 檢查 iptables (如果存在)
+        if command -v iptables >/dev/null 2>&1; then
+            if iptables -L INPUT 2>/dev/null | grep -q "DROP\|REJECT"; then
+                print_warning "檢測到 iptables 規則，可能影響外部訪問"
+            fi
+        fi
+    else
+        print_info "服務將監聽: $HOST"
+    fi
 }
 # =============================================================================
 # Service Management Functions
@@ -208,6 +243,7 @@ start_instance() {
     cd "$WORK_DIR"
     nohup "$PYTHON_BIN" "$SCRIPT_NAME" \
         --port "$port" \
+        --server "$HOST" \
         --username "$username" \
         --password "$password" \
         > "$log_file" 2>&1 &
@@ -319,6 +355,7 @@ cmd_start() {
 
     create_directories
     check_dependencies
+    check_network
 
     local success=true
 
@@ -338,8 +375,16 @@ cmd_start() {
         print_success "所有服務啟動完成"
         echo ""
         print_info "訪問地址:"
-        echo "  主服務: http://localhost:$DEFAULT_PORT"
-        [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://localhost:$SECOND_PORT"
+        if [[ "$HOST" == "0.0.0.0" ]]; then
+            local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "YOUR_IP")
+            echo "  主服務: http://localhost:$DEFAULT_PORT (本機)"
+            echo "  主服務: http://$local_ip:$DEFAULT_PORT (外部訪問)"
+            [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://localhost:$SECOND_PORT (本機)"
+            [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://$local_ip:$SECOND_PORT (外部訪問)"
+        else
+            echo "  主服務: http://$HOST:$DEFAULT_PORT"
+            [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://$HOST:$SECOND_PORT"
+        fi
         echo ""
         print_info "默認登錄信息:"
         echo "  用戶名: $USERNAME"
@@ -437,6 +482,7 @@ cmd_help() {
     echo "  工作目錄: $WORK_DIR"
     echo "  Python: $PYTHON_BIN"
     echo "  腳本: $SCRIPT_NAME"
+    echo "  監聽地址: $HOST"
     echo "  主端口: $DEFAULT_PORT"
     echo "  第二端口: $SECOND_PORT (啟用: $ENABLE_SECOND_GPU)"
     echo "  GPU 設備: ${GPU_DEVICES[*]}"
