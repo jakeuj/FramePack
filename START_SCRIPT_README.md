@@ -1,10 +1,12 @@
 # FramePack Service Manager
 
-重構後的 `start.sh` 腳本，專為 Ubuntu 24.04 設計，提供完整的服務管理功能。
+跨平台的 `start.sh` 腳本，支援 **macOS (開發環境)** 和 **Ubuntu (部署環境)**，提供完整的服務管理功能和自動環境配置。
 
 ## 功能特色
 
-- ✅ **Ubuntu 24.04 兼容性**: 針對 Ubuntu 24.04 優化
+- 🌍 **跨平台支援**: 自動檢測 macOS 和 Ubuntu 環境
+- ⚙️ **智能環境配置**: 根據操作系統自動設定環境變數
+- 🔧 **雙模式運行**: 開發模式 (dev) 和生產模式 (start)
 - ✅ **完整服務管理**: 支援 start、stop、restart、status 命令
 - ✅ **智能進程管理**: 使用 PID 文件和鎖文件確保服務穩定性
 - ✅ **優雅停止**: 先嘗試 SIGTERM，超時後使用 SIGKILL
@@ -15,27 +17,32 @@
 
 ## 使用方法
 
-### 基本命令
+### 🖥️ 跨平台命令
 
 ```bash
-# 啟動服務
-./start.sh start
+# 🚀 生產模式 (自動服務管理)
+./start.sh start     # 啟動服務
+./start.sh stop      # 停止服務
+./start.sh restart   # 重啟服務
+./start.sh status    # 檢查狀態
 
-# 停止服務
-./start.sh stop
+# 🔧 開發模式 (互動式選擇)
+./start.sh dev       # 開發模式，可選擇不同版本
 
-# 重啟服務
-./start.sh restart
-
-# 檢查狀態
-./start.sh status
-
-# 檢查 GPU 信息
-./start.sh gpu
-
-# 顯示幫助
-./start.sh help
+# 📊 信息查看
+./start.sh gpu       # 檢查 GPU 信息
+./start.sh help      # 顯示幫助
 ```
+
+### 🌍 平台差異
+
+| 功能 | macOS (開發) | Ubuntu (部署) |
+|------|-------------|---------------|
+| **環境變數** | `PYTORCH_ENABLE_MPS_FALLBACK=1`<br>`TOKENIZERS_PARALLELISM=false` | `TOKENIZERS_PARALLELISM=false`<br>`CUDA_VISIBLE_DEVICES=0,1,2,3` |
+| **GPU 支援** | Apple Silicon MPS | NVIDIA CUDA |
+| **默認監聽** | `127.0.0.1` (本機) | `0.0.0.0` (外部訪問) |
+| **開發模式** | ✅ 互動式選擇 | ✅ 互動式選擇 |
+| **生產模式** | ✅ 自動服務管理 | ✅ 自動服務管理 |
 
 ### 默認配置
 

@@ -1,9 +1,71 @@
 #!/bin/bash
 
-# FramePack Service Manager for Ubuntu 24.04
-# Usage: ./start.sh [start|stop|restart|status]
+# FramePack Service Manager - 跨平台版本
+# 支援 macOS (開發環境) 和 Ubuntu (部署環境)
+# Usage: ./start.sh [start|stop|restart|status|dev]
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
+# =============================================================================
+# 操作系統檢測和環境設定
+# =============================================================================
+
+# 操作系統檢測
+detect_os() {
+    case "$(uname -s)" in
+        Darwin*)
+            OS="macOS"
+            IS_MACOS=true
+            IS_UBUNTU=false
+            ;;
+        Linux*)
+            if [[ -f /etc/os-release ]]; then
+                . /etc/os-release
+                if [[ "$ID" == "ubuntu" ]]; then
+                    OS="Ubuntu $VERSION_ID"
+                    IS_UBUNTU=true
+                    IS_MACOS=false
+                else
+                    OS="Linux ($ID)"
+                    IS_UBUNTU=true  # 假設其他 Linux 發行版使用類似 Ubuntu 的配置
+                    IS_MACOS=false
+                fi
+            else
+                OS="Linux"
+                IS_UBUNTU=true
+                IS_MACOS=false
+            fi
+            ;;
+        *)
+            OS="Unknown"
+            IS_UBUNTU=false
+            IS_MACOS=false
+            ;;
+    esac
+}
+
+# 設定平台特定的環境變數
+setup_platform_env() {
+    if [[ "$IS_MACOS" == true ]]; then
+        # macOS 特定環境變數 (Apple Silicon MPS 支援)
+        export PYTORCH_ENABLE_MPS_FALLBACK=1
+        export TOKENIZERS_PARALLELISM=false
+        # macOS 上通常使用 localhost 進行開發
+        if [[ "$HOST" == "0.0.0.0" ]] && [[ "${FORCE_EXTERNAL_ACCESS:-false}" != "true" ]]; then
+            HOST="127.0.0.1"  # macOS 開發環境默認本機訪問
+        fi
+    elif [[ "$IS_UBUNTU" == true ]]; then
+        # Ubuntu/Linux 特定環境變數
+        export TOKENIZERS_PARALLELISM=false
+        # 設定 CUDA 相關環境變數（如果有 GPU）
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3"}
+        fi
+    fi
+}
+
+# 初始化操作系統檢測
+detect_os
 
 # =============================================================================
 # Configuration Section
@@ -389,6 +451,7 @@ cmd_start() {
     print_info "啟動 FramePack 服務..."
 
     create_directories
+    setup_platform_env
     check_dependencies
     detect_gpus
     check_network
@@ -512,6 +575,81 @@ cmd_status() {
     fi
 }
 
+# 開發模式 (類似原來的 start_framepack.sh)
+cmd_dev() {
+    print_info "🚀 FramePack 開發模式"
+    print_info "操作系統: $OS"
+    echo ""
+
+    # 設定環境變數
+    setup_platform_env
+
+    # 顯示環境信息
+    if [[ "$IS_MACOS" == true ]]; then
+        print_info "✅ macOS 環境變數已設置:"
+        print_info "   PYTORCH_ENABLE_MPS_FALLBACK=1"
+        print_info "   TOKENIZERS_PARALLELISM=false"
+    else
+        print_info "✅ Ubuntu 環境變數已設置:"
+        print_info "   TOKENIZERS_PARALLELISM=false"
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            print_info "   CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+        fi
+    fi
+
+    # 檢查虛擬環境
+    if [[ -f "$PYTHON_BIN" ]]; then
+        print_success "✅ 發現虛擬環境: $VENV_PATH"
+    else
+        print_warning "⚠️ 未發現虛擬環境，請先創建: python3 -m venv .venv"
+        exit 1
+    fi
+
+    # 檢查 Python 版本
+    python_version=$("$PYTHON_BIN" --version 2>&1)
+    print_info "🐍 Python 版本: $python_version"
+
+    # 顯示選項
+    echo ""
+    print_info "請選擇要啟動的版本:"
+    echo "1) FramePack 基礎版本 (demo_gradio_refactored.py)"
+    echo "2) FramePack F1 版本 (demo_gradio_f1_refactored.py) - 包含認證和高級功能"
+    echo "3) 退出"
+
+    read -p "請輸入選項 (1-3): " choice
+
+    case $choice in
+        1)
+            print_info "🎬 啟動 FramePack 基礎版本..."
+            if [[ -f "$WORK_DIR/demo_gradio_refactored.py" ]]; then
+                "$PYTHON_BIN" "$WORK_DIR/demo_gradio_refactored.py"
+            else
+                print_error "找不到 demo_gradio_refactored.py"
+                exit 1
+            fi
+            ;;
+        2)
+            print_info "🎬 啟動 FramePack F1 版本..."
+            print_info "💡 提示: 默認用戶名/密碼為 admin/123456"
+            print_info "💡 可以使用 --no-auth 參數禁用認證"
+            if [[ -f "$SCRIPT_PATH" ]]; then
+                "$PYTHON_BIN" "$SCRIPT_PATH"
+            else
+                print_error "找不到 $SCRIPT_NAME"
+                exit 1
+            fi
+            ;;
+        3)
+            print_info "👋 再見！"
+            exit 0
+            ;;
+        *)
+            print_error "❌ 無效選項"
+            exit 1
+            ;;
+    esac
+}
+
 # 顯示 GPU 信息
 cmd_gpu_info() {
     print_info "GPU 信息檢查..."
@@ -528,22 +666,27 @@ cmd_gpu_info() {
 
 # 顯示幫助信息
 cmd_help() {
-    echo "FramePack Service Manager for Ubuntu 24.04"
+    echo "FramePack Service Manager - 跨平台版本"
+    echo "支援 macOS (開發環境) 和 Ubuntu (部署環境)"
     echo ""
     echo "用法: $0 [COMMAND]"
     echo ""
     echo "命令:"
-    echo "  start     啟動服務"
+    echo "  start     啟動服務 (生產模式)"
     echo "  stop      停止服務"
     echo "  restart   重啟服務"
     echo "  status    檢查服務狀態"
+    echo "  dev       開發模式 (互動式選擇)"
     echo "  gpu       顯示 GPU 信息"
     echo "  help      顯示此幫助信息"
     echo ""
-    echo "配置:"
+    echo "系統信息:"
+    echo "  操作系統: $OS"
     echo "  工作目錄: $WORK_DIR"
     echo "  Python: $PYTHON_BIN"
     echo "  腳本: $SCRIPT_NAME"
+    echo ""
+    echo "服務配置:"
     echo "  監聽地址: $HOST"
     echo "  主端口: $DEFAULT_PORT"
     echo "  第二端口: $SECOND_PORT"
@@ -553,6 +696,15 @@ cmd_help() {
         echo "  第二個 GPU 服務: $([ "$ENABLE_SECOND_GPU" = true ] && echo "自動啟用" || echo "未啟用")"
     else
         echo "  GPU 狀態: 將在啟動時自動偵測"
+    fi
+    echo ""
+    echo "環境變數:"
+    if [[ "$IS_MACOS" == true ]]; then
+        echo "  PYTORCH_ENABLE_MPS_FALLBACK: ${PYTORCH_ENABLE_MPS_FALLBACK:-未設置}"
+        echo "  TOKENIZERS_PARALLELISM: ${TOKENIZERS_PARALLELISM:-未設置}"
+    else
+        echo "  TOKENIZERS_PARALLELISM: ${TOKENIZERS_PARALLELISM:-未設置}"
+        echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-未設置}"
     fi
     echo ""
     echo "文件位置:"
@@ -590,6 +742,9 @@ main() {
             ;;
         status)
             cmd_status
+            ;;
+        dev)
+            cmd_dev
             ;;
         gpu)
             cmd_gpu_info
