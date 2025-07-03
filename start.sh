@@ -248,7 +248,9 @@ is_port_in_use() {
 # 檢查進程是否存在
 is_process_running() {
     local pid=$1
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+    # 清理 PID 並檢查是否為有效數字
+    pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]*')
+    [[ -n "$pid" ]] && [[ "$pid" -gt 0 ]] 2>/dev/null && kill -0 "$pid" 2>/dev/null
 }
 
 # 從 PID 文件獲取 PID
@@ -323,6 +325,23 @@ start_instance() {
         return 1
     fi
 
+    # 檢查並清理舊的鎖文件
+    if [[ -f "$lock_file" ]]; then
+        local lock_pid
+        if lock_pid=$(cat "$lock_file" 2>/dev/null) && [[ -n "$lock_pid" ]]; then
+            if ! is_process_running "$lock_pid"; then
+                print_warning "清理舊的鎖文件 (PID $lock_pid 已不存在)"
+                rm -f "$lock_file"
+            else
+                print_error "另一個實例正在啟動 (PID: $lock_pid)"
+                return 1
+            fi
+        else
+            print_warning "清理無效的鎖文件"
+            rm -f "$lock_file"
+        fi
+    fi
+
     # 創建鎖文件
     if ! (set -C; echo $$ > "$lock_file") 2>/dev/null; then
         print_error "無法創建鎖文件，可能有其他實例正在啟動"
@@ -347,21 +366,34 @@ start_instance() {
 
     local pid=$!
 
+    # 清理 PID 變數中的任何不可見字符
+    pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]*')
+
+    # 檢查 PID 是否有效
+    if [[ -z "$pid" ]] || [[ "$pid" -eq 0 ]] 2>/dev/null; then
+        print_error "無法獲取有效的進程 PID"
+        rm -f "$lock_file"
+        return 1
+    fi
+
     # 保存 PID
     echo "$pid" > "$pid_file"
 
     # 清理鎖文件
     rm -f "$lock_file"
 
-    # 等待服務啟動
-    sleep 3
+    # 等待服務啟動 - 增加等待時間因為模型加載需要時間
+    print_info "等待服務啟動 (模型加載中...)..."
+    sleep 5
 
     if is_process_running "$pid"; then
         print_success "GPU $gpu_id 服務已啟動，PID=$pid，端口=$port"
         print_info "日誌文件: $log_file"
+        print_info "服務正在加載模型，請稍候..."
         return 0
     else
         print_error "GPU $gpu_id 服務啟動失敗"
+        print_info "請檢查日誌文件: $log_file"
         rm -f "$pid_file"
         return 1
     fi
@@ -664,6 +696,45 @@ cmd_gpu_info() {
     fi
 }
 
+# 清理系統文件
+cmd_clean() {
+    print_info "清理 FramePack 系統文件..."
+
+    # 停止所有服務
+    print_info "首先停止所有運行中的服務..."
+    cmd_stop
+
+    # 清理鎖文件
+    cleanup_lock_files
+
+    # 清理孤立的 PID 文件
+    if [[ -d "$PID_DIR" ]]; then
+        local pid_files
+        pid_files=$(find "$PID_DIR" -name "framepack_*.pid" 2>/dev/null || true)
+        if [[ -n "$pid_files" ]]; then
+            print_info "清理 PID 文件..."
+            for pid_file in $pid_files; do
+                if [[ -f "$pid_file" ]]; then
+                    local pid
+                    if pid=$(cat "$pid_file" 2>/dev/null) && [[ -n "$pid" ]]; then
+                        if ! is_process_running "$pid"; then
+                            print_info "清理孤立的 PID 文件: $(basename "$pid_file")"
+                            rm -f "$pid_file"
+                        else
+                            print_warning "跳過運行中的進程 PID 文件: $(basename "$pid_file") (PID: $pid)"
+                        fi
+                    else
+                        print_info "清理無效的 PID 文件: $(basename "$pid_file")"
+                        rm -f "$pid_file"
+                    fi
+                fi
+            done
+        fi
+    fi
+
+    print_success "清理完成"
+}
+
 # 顯示幫助信息
 cmd_help() {
     echo "FramePack Service Manager - 跨平台版本"
@@ -678,6 +749,7 @@ cmd_help() {
     echo "  status    檢查服務狀態"
     echo "  dev       開發模式 (互動式選擇)"
     echo "  gpu       顯示 GPU 信息"
+    echo "  clean     清理系統文件 (PID 文件、鎖文件等)"
     echo "  help      顯示此幫助信息"
     echo ""
     echo "系統信息:"
@@ -716,11 +788,24 @@ cmd_help() {
 # Main Execution
 # =============================================================================
 
-# 信號處理
+# 信號處理和清理函數
 cleanup() {
     print_info "接收到終止信號，正在清理..."
     cmd_stop
+    cleanup_lock_files
     exit 0
+}
+
+# 清理所有鎖文件
+cleanup_lock_files() {
+    if [[ -d "$LOCK_DIR" ]]; then
+        local lock_files
+        lock_files=$(find "$LOCK_DIR" -name "framepack_*.lock" 2>/dev/null || true)
+        if [[ -n "$lock_files" ]]; then
+            print_info "清理鎖文件..."
+            rm -f "$LOCK_DIR"/framepack_*.lock 2>/dev/null || true
+        fi
+    fi
 }
 
 # 設置信號處理
@@ -749,6 +834,9 @@ main() {
         gpu)
             cmd_gpu_info
             ;;
+        clean)
+            cmd_clean
+            ;;
         help|--help|-h)
             cmd_help
             ;;
@@ -767,6 +855,7 @@ if [[ $EUID -eq 0 ]]; then
     read -p "是否繼續？(y/N): " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_info "已取消執行"
         exit 1
     fi
 fi
