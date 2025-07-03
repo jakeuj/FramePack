@@ -78,7 +78,7 @@ WORK_DIR="${SCRIPT_DIR}"
 # Python 環境設置
 VENV_PATH="${WORK_DIR}/.venv"
 PYTHON_BIN="${VENV_PATH}/bin/python"
-SCRIPT_NAME="demo_gradio_f1_refactored.py"
+SCRIPT_NAME="main.py"
 SCRIPT_PATH="${WORK_DIR}/${SCRIPT_NAME}"
 
 # 服務配置
