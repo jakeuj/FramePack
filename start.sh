@@ -31,9 +31,9 @@ PID_DIR="${WORK_DIR}/pids"
 LOG_DIR="${WORK_DIR}/logs"
 LOCK_DIR="${WORK_DIR}/locks"
 
-# GPU 配置
-GPU_DEVICES=(0)  # 可以添加更多 GPU: (0 1 2)
-ENABLE_SECOND_GPU=false  # 設為 true 啟用第二個 GPU
+# GPU 配置 - 自動偵測
+GPU_DEVICES=()  # 將自動偵測可用的 GPU
+ENABLE_SECOND_GPU=false  # 將根據 GPU 數量自動設定
 
 # =============================================================================
 # Utility Functions
@@ -48,6 +48,51 @@ print_error() { echo -e "\033[1;31m[ERROR]\033[0m $1"; }
 # 創建必要目錄
 create_directories() {
     mkdir -p "$PID_DIR" "$LOG_DIR" "$LOCK_DIR"
+}
+
+# 自動偵測 GPU
+detect_gpus() {
+    print_info "自動偵測 GPU 設備..."
+
+    GPU_DEVICES=()
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        # 獲取可用的 GPU 數量和信息
+        local gpu_count
+        gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits | wc -l)
+
+        if [[ $gpu_count -gt 0 ]]; then
+            print_success "檢測到 $gpu_count 張 NVIDIA GPU"
+
+            # 獲取 GPU 索引
+            while IFS= read -r gpu_index; do
+                GPU_DEVICES+=("$gpu_index")
+                local gpu_info
+                gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits -i "$gpu_index")
+                print_info "GPU $gpu_index: $gpu_info"
+            done < <(nvidia-smi --query-gpu=index --format=csv,noheader,nounits)
+
+            # 自動啟用第二個 GPU（如果有）
+            if [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
+                ENABLE_SECOND_GPU=true
+                print_success "自動啟用第二個 GPU 服務"
+            else
+                ENABLE_SECOND_GPU=false
+                print_info "只有一張 GPU，不啟用第二個服務"
+            fi
+        else
+            print_warning "未檢測到可用的 NVIDIA GPU"
+            GPU_DEVICES=(0)  # 默認使用 GPU 0（可能是 CPU 模式）
+            ENABLE_SECOND_GPU=false
+        fi
+    else
+        print_warning "nvidia-smi 不可用，將使用 CPU 模式"
+        GPU_DEVICES=(0)  # 默認使用設備 0
+        ENABLE_SECOND_GPU=false
+    fi
+
+    print_info "GPU 配置: ${GPU_DEVICES[*]}"
+    print_info "第二個 GPU 服務: $([ "$ENABLE_SECOND_GPU" = true ] && echo "啟用" || echo "禁用")"
 }
 
 # 檢查依賴
@@ -65,16 +110,6 @@ check_dependencies() {
     if [[ ! -f "$SCRIPT_PATH" ]]; then
         print_error "腳本文件不存在: $SCRIPT_PATH"
         exit 1
-    fi
-
-    # 檢查 CUDA (如果有 GPU)
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        print_info "檢測到 NVIDIA GPU"
-        nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits | while read -r line; do
-            print_info "GPU: $line"
-        done
-    else
-        print_warning "未檢測到 NVIDIA GPU，將使用 CPU 模式"
     fi
 
     print_success "依賴檢查完成"
@@ -355,17 +390,25 @@ cmd_start() {
 
     create_directories
     check_dependencies
+    detect_gpus
     check_network
 
     local success=true
+
+    # 確保至少有一個 GPU 設備
+    if [[ ${#GPU_DEVICES[@]} -eq 0 ]]; then
+        print_warning "未檢測到 GPU 設備，使用默認設備 0"
+        GPU_DEVICES=(0)
+    fi
 
     # 啟動主要服務
     if ! start_instance "${GPU_DEVICES[0]}" "$DEFAULT_PORT" "$USERNAME" "$PASSWORD"; then
         success=false
     fi
 
-    # 啟動第二個 GPU 服務（如果啟用）
+    # 啟動第二個 GPU 服務（如果啟用且有第二個 GPU）
     if [[ "$ENABLE_SECOND_GPU" == "true" ]] && [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
+        print_info "啟動第二個 GPU 服務..."
         if ! start_instance "${GPU_DEVICES[1]}" "$SECOND_PORT" "$USERNAME" "$PASSWORD"; then
             success=false
         fi
@@ -377,13 +420,17 @@ cmd_start() {
         print_info "訪問地址:"
         if [[ "$HOST" == "0.0.0.0" ]]; then
             local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "YOUR_IP")
-            echo "  主服務: http://localhost:$DEFAULT_PORT (本機)"
-            echo "  主服務: http://$local_ip:$DEFAULT_PORT (外部訪問)"
-            [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://localhost:$SECOND_PORT (本機)"
-            [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://$local_ip:$SECOND_PORT (外部訪問)"
+            echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://localhost:$DEFAULT_PORT (本機)"
+            echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://$local_ip:$DEFAULT_PORT (外部訪問)"
+            if [[ "$ENABLE_SECOND_GPU" == "true" ]] && [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
+                echo "  第二服務 (GPU ${GPU_DEVICES[1]}): http://localhost:$SECOND_PORT (本機)"
+                echo "  第二服務 (GPU ${GPU_DEVICES[1]}): http://$local_ip:$SECOND_PORT (外部訪問)"
+            fi
         else
-            echo "  主服務: http://$HOST:$DEFAULT_PORT"
-            [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://$HOST:$SECOND_PORT"
+            echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://$HOST:$DEFAULT_PORT"
+            if [[ "$ENABLE_SECOND_GPU" == "true" ]] && [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
+                echo "  第二服務 (GPU ${GPU_DEVICES[1]}): http://$HOST:$SECOND_PORT"
+            fi
         fi
         echo ""
         print_info "默認登錄信息:"
@@ -465,6 +512,20 @@ cmd_status() {
     fi
 }
 
+# 顯示 GPU 信息
+cmd_gpu_info() {
+    print_info "GPU 信息檢查..."
+    detect_gpus
+    echo ""
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        print_info "詳細 GPU 信息:"
+        nvidia-smi
+    else
+        print_warning "nvidia-smi 不可用，無法顯示詳細 GPU 信息"
+    fi
+}
+
 # 顯示幫助信息
 cmd_help() {
     echo "FramePack Service Manager for Ubuntu 24.04"
@@ -476,6 +537,7 @@ cmd_help() {
     echo "  stop      停止服務"
     echo "  restart   重啟服務"
     echo "  status    檢查服務狀態"
+    echo "  gpu       顯示 GPU 信息"
     echo "  help      顯示此幫助信息"
     echo ""
     echo "配置:"
@@ -484,8 +546,14 @@ cmd_help() {
     echo "  腳本: $SCRIPT_NAME"
     echo "  監聽地址: $HOST"
     echo "  主端口: $DEFAULT_PORT"
-    echo "  第二端口: $SECOND_PORT (啟用: $ENABLE_SECOND_GPU)"
-    echo "  GPU 設備: ${GPU_DEVICES[*]}"
+    echo "  第二端口: $SECOND_PORT"
+    echo "  GPU 自動偵測: 啟用"
+    if [[ ${#GPU_DEVICES[@]} -gt 0 ]]; then
+        echo "  檢測到的 GPU: ${GPU_DEVICES[*]}"
+        echo "  第二個 GPU 服務: $([ "$ENABLE_SECOND_GPU" = true ] && echo "自動啟用" || echo "未啟用")"
+    else
+        echo "  GPU 狀態: 將在啟動時自動偵測"
+    fi
     echo ""
     echo "文件位置:"
     echo "  PID 文件: $PID_DIR"
@@ -522,6 +590,9 @@ main() {
             ;;
         status)
             cmd_status
+            ;;
+        gpu)
+            cmd_gpu_info
             ;;
         help|--help|-h)
             cmd_help

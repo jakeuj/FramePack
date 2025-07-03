@@ -9,7 +9,7 @@
 - ✅ **智能進程管理**: 使用 PID 文件和鎖文件確保服務穩定性
 - ✅ **優雅停止**: 先嘗試 SIGTERM，超時後使用 SIGKILL
 - ✅ **詳細狀態監控**: 顯示 CPU、記憶體使用率和 GPU 狀態
-- ✅ **多 GPU 支援**: 可配置多個 GPU 實例
+- ✅ **智能 GPU 偵測**: 自動偵測並配置多個 GPU 實例
 - ✅ **完整日誌記錄**: 每個服務實例獨立日誌
 - ✅ **錯誤處理**: 完善的錯誤檢查和恢復機制
 
@@ -29,6 +29,9 @@
 
 # 檢查狀態
 ./start.sh status
+
+# 檢查 GPU 信息
+./start.sh gpu
 
 # 顯示幫助
 ./start.sh help
@@ -52,9 +55,9 @@
 # 網路配置
 HOST="0.0.0.0"  # 監聽所有網路介面，允許外部訪問 (對應 --server 參數)
 
-# GPU 配置
-GPU_DEVICES=(0)  # 可以添加更多 GPU: (0 1 2)
-ENABLE_SECOND_GPU=false  # 設為 true 啟用第二個 GPU
+# GPU 配置 - 自動偵測
+GPU_DEVICES=()  # 將自動偵測可用的 GPU
+ENABLE_SECOND_GPU=false  # 將根據 GPU 數量自動設定
 
 # 端口配置
 DEFAULT_PORT=7860
@@ -63,6 +66,33 @@ SECOND_PORT=7861
 # 認證配置
 USERNAME="admin"
 PASSWORD="123456"
+```
+
+## 🤖 智能 GPU 偵測
+
+### 自動偵測功能
+
+腳本會自動偵測系統中的 NVIDIA GPU：
+
+1. **單 GPU 系統**: 只啟動主服務 (端口 7860)
+2. **多 GPU 系統**: 自動啟動第二個服務 (端口 7861)
+3. **無 GPU 系統**: 使用 CPU 模式
+
+### GPU 信息查看
+
+```bash
+# 查看 GPU 偵測結果
+./start.sh gpu
+```
+
+輸出示例：
+```
+GPU 信息檢查...
+檢測到 2 張 NVIDIA GPU
+GPU 0: NVIDIA GeForce RTX 4090, 24564 MiB
+GPU 1: NVIDIA GeForce RTX 4080, 16376 MiB
+GPU 配置: 0 1
+第二個 GPU 服務: 自動啟用
 ```
 
 ## 外部訪問設定
@@ -126,6 +156,29 @@ FramePackB/
 - 端口監聽狀態
 - 系統記憶體使用情況
 - GPU 使用情況 (如果有 NVIDIA GPU)
+
+## GPU 管理
+
+### 自動配置邏輯
+
+| GPU 數量 | 主服務 (7860) | 第二服務 (7861) | 說明 |
+|----------|---------------|-----------------|------|
+| 0 (無GPU) | ✅ CPU 模式 | ❌ 不啟動 | 使用 CPU 進行推理 |
+| 1 | ✅ GPU 0 | ❌ 不啟動 | 單 GPU 模式 |
+| 2+ | ✅ GPU 0 | ✅ GPU 1 | 多 GPU 並行服務 |
+
+### 手動覆蓋配置
+
+如果需要手動控制 GPU 配置，可以修改腳本：
+
+```bash
+# 強制使用特定 GPU
+GPU_DEVICES=(0 2)  # 使用 GPU 0 和 GPU 2
+ENABLE_SECOND_GPU=true
+
+# 強制禁用第二個 GPU
+ENABLE_SECOND_GPU=false
+```
 
 ## 日誌管理
 
