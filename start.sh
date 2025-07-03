@@ -1,49 +1,503 @@
 #!/bin/bash
 
-# 這裡要改成絕對路徑
-cd ~/FramePack
+# FramePack Service Manager for Ubuntu 24.04
+# Usage: ./start.sh [start|stop|restart|status]
 
-# 這裡要改成虛擬環境路徑
-PYTHON_BIN="./.venv312/bin/python"
-SCRIPT="demo_gradio_f1_refactored.py"
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
-# 帳號密碼
+# =============================================================================
+# Configuration Section
+# =============================================================================
+
+# 工作目錄 - 改為當前腳本所在目錄
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="${SCRIPT_DIR}"
+
+# Python 環境設置
+VENV_PATH="${WORK_DIR}/.venv"
+PYTHON_BIN="${VENV_PATH}/bin/python"
+SCRIPT_NAME="demo_gradio_f1_refactored.py"
+SCRIPT_PATH="${WORK_DIR}/${SCRIPT_NAME}"
+
+# 服務配置
 USERNAME="admin"
 PASSWORD="123456"
+DEFAULT_PORT=7860
+SECOND_PORT=7861
 
-# 函式：停止已執行的特定實例
-stop_if_running() {
-    GPU_ID=$1
-    PORT=$2
-    NAME=$3
-    PWD=$4
-    PIDS=$(ps aux | grep "$SCRIPT --port $PORT" | grep -v grep | awk '{print $2}')
-    if [ -n "$PIDS" ]; then
-        echo "🛑 偵測到 GPU $GPU_ID / Port $PORT 已在執行，正在終止：$PIDS"
-        kill $PIDS
-        sleep 1
+# 系統配置
+PID_DIR="${WORK_DIR}/pids"
+LOG_DIR="${WORK_DIR}/logs"
+LOCK_DIR="${WORK_DIR}/locks"
+
+# GPU 配置
+GPU_DEVICES=(0)  # 可以添加更多 GPU: (0 1 2)
+ENABLE_SECOND_GPU=false  # 設為 true 啟用第二個 GPU
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+# 顏色輸出函數
+print_info() { echo -e "\033[1;34m[INFO]\033[0m $1"; }
+print_success() { echo -e "\033[1;32m[SUCCESS]\033[0m $1"; }
+print_warning() { echo -e "\033[1;33m[WARNING]\033[0m $1"; }
+print_error() { echo -e "\033[1;31m[ERROR]\033[0m $1"; }
+
+# 創建必要目錄
+create_directories() {
+    mkdir -p "$PID_DIR" "$LOG_DIR" "$LOCK_DIR"
+}
+
+# 檢查依賴
+check_dependencies() {
+    print_info "檢查系統依賴..."
+
+    # 檢查 Python 虛擬環境
+    if [[ ! -f "$PYTHON_BIN" ]]; then
+        print_error "Python 虛擬環境不存在: $PYTHON_BIN"
+        print_info "請先創建虛擬環境: python3 -m venv $VENV_PATH"
+        exit 1
+    fi
+
+    # 檢查腳本文件
+    if [[ ! -f "$SCRIPT_PATH" ]]; then
+        print_error "腳本文件不存在: $SCRIPT_PATH"
+        exit 1
+    fi
+
+    # 檢查 CUDA (如果有 GPU)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        print_info "檢測到 NVIDIA GPU"
+        nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits | while read -r line; do
+            print_info "GPU: $line"
+        done
+    else
+        print_warning "未檢測到 NVIDIA GPU，將使用 CPU 模式"
+    fi
+
+    print_success "依賴檢查完成"
+}
+# =============================================================================
+# Service Management Functions
+# =============================================================================
+
+# 獲取服務實例的 PID 文件路徑
+get_pid_file() {
+    local port=$1
+    echo "${PID_DIR}/framepack_${port}.pid"
+}
+
+# 獲取服務實例的日誌文件路徑
+get_log_file() {
+    local port=$1
+    echo "${LOG_DIR}/framepack_${port}.log"
+}
+
+# 獲取服務實例的鎖文件路徑
+get_lock_file() {
+    local port=$1
+    echo "${LOCK_DIR}/framepack_${port}.lock"
+}
+
+# 檢查端口是否被佔用
+is_port_in_use() {
+    local port=$1
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln | grep -q ":${port} "
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tuln | grep -q ":${port} "
+    else
+        # 使用 lsof 作為後備
+        lsof -i ":${port}" >/dev/null 2>&1
     fi
 }
 
-# 函式：啟動指定 GPU 和 Port
-start_instance() {
-    GPU_ID=$1
-    PORT=$2
-    NAME=$3
-    PWD=$4
-    LOGFILE="output_${PORT}.log"
-
-    echo "🚀 啟動 GPU $GPU_ID / Port $PORT"
-    nohup env CUDA_VISIBLE_DEVICES=$GPU_ID $PYTHON_BIN $SCRIPT --port $PORT --username $NAME --password $PWD > $LOGFILE >
-    echo "✅ GPU $GPU_ID 實例已啟動，PID=$!"
+# 檢查進程是否存在
+is_process_running() {
+    local pid=$1
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
-# === 執行重啟程序 ===
-stop_if_running 0 7860 $USERNAME $PASSWORD
-start_instance 0 7860 $USERNAME $PASSWORD
+# 從 PID 文件獲取 PID
+get_pid_from_file() {
+    local pid_file=$1
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null)
+        if is_process_running "$pid"; then
+            echo "$pid"
+            return 0
+        else
+            # PID 文件存在但進程不存在，清理文件
+            rm -f "$pid_file"
+            return 1
+        fi
+    fi
+    return 1
+}
 
-# 如果有第二張顯卡
-# stop_if_running 1 7861 $USERNAME $PASSWORD
-# start_instance 1 7861 $USERNAME $PASSWORD
+# 等待進程停止
+wait_for_process_stop() {
+    local pid=$1
+    local timeout=${2:-10}
+    local count=0
 
-echo "🔁 所有服務已強制重啟完成"
+    while is_process_running "$pid" && [[ $count -lt $timeout ]]; do
+        sleep 1
+        ((count++))
+    done
+
+    ! is_process_running "$pid"
+}
+
+# 強制終止進程
+force_kill_process() {
+    local pid=$1
+    if is_process_running "$pid"; then
+        print_warning "強制終止進程 $pid"
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+}
+# =============================================================================
+# Core Service Functions
+# =============================================================================
+
+# 啟動單個服務實例
+start_instance() {
+    local gpu_id=$1
+    local port=$2
+    local username=$3
+    local password=$4
+
+    local pid_file
+    local log_file
+    local lock_file
+
+    pid_file=$(get_pid_file "$port")
+    log_file=$(get_log_file "$port")
+    lock_file=$(get_lock_file "$port")
+
+    # 檢查是否已經在運行
+    if get_pid_from_file "$pid_file" >/dev/null; then
+        print_warning "GPU $gpu_id / Port $port 服務已在運行"
+        return 0
+    fi
+
+    # 檢查端口是否被其他程序佔用
+    if is_port_in_use "$port"; then
+        print_error "端口 $port 已被其他程序佔用"
+        return 1
+    fi
+
+    # 創建鎖文件
+    if ! (set -C; echo $$ > "$lock_file") 2>/dev/null; then
+        print_error "無法創建鎖文件，可能有其他實例正在啟動"
+        return 1
+    fi
+
+    print_info "啟動 GPU $gpu_id / Port $port 服務..."
+
+    # 設置環境變數
+    export CUDA_VISIBLE_DEVICES=$gpu_id
+    export PYTORCH_ENABLE_MPS_FALLBACK=1
+    export TOKENIZERS_PARALLELISM=false
+
+    # 啟動服務
+    cd "$WORK_DIR"
+    nohup "$PYTHON_BIN" "$SCRIPT_NAME" \
+        --port "$port" \
+        --username "$username" \
+        --password "$password" \
+        > "$log_file" 2>&1 &
+
+    local pid=$!
+
+    # 保存 PID
+    echo "$pid" > "$pid_file"
+
+    # 清理鎖文件
+    rm -f "$lock_file"
+
+    # 等待服務啟動
+    sleep 3
+
+    if is_process_running "$pid"; then
+        print_success "GPU $gpu_id 服務已啟動，PID=$pid，端口=$port"
+        print_info "日誌文件: $log_file"
+        return 0
+    else
+        print_error "GPU $gpu_id 服務啟動失敗"
+        rm -f "$pid_file"
+        return 1
+    fi
+}
+
+# 停止單個服務實例
+stop_instance() {
+    local port=$1
+    local pid_file
+    local pid
+
+    pid_file=$(get_pid_file "$port")
+
+    if ! pid=$(get_pid_from_file "$pid_file"); then
+        print_warning "端口 $port 的服務未在運行"
+        return 0
+    fi
+
+    print_info "停止端口 $port 的服務 (PID: $pid)..."
+
+    # 嘗試優雅停止
+    kill -TERM "$pid" 2>/dev/null || true
+
+    if wait_for_process_stop "$pid" 10; then
+        print_success "服務已優雅停止"
+    else
+        print_warning "優雅停止超時，強制終止..."
+        force_kill_process "$pid"
+
+        if wait_for_process_stop "$pid" 5; then
+            print_success "服務已強制停止"
+        else
+            print_error "無法停止服務"
+            return 1
+        fi
+    fi
+
+    # 清理文件
+    rm -f "$pid_file"
+    return 0
+}
+
+# 檢查服務狀態
+check_instance_status() {
+    local port=$1
+    local pid_file
+    local pid
+
+    pid_file=$(get_pid_file "$port")
+
+    if pid=$(get_pid_from_file "$pid_file"); then
+        local cpu_usage
+        local mem_usage
+        local start_time
+
+        # 獲取進程信息
+        if command -v ps >/dev/null 2>&1; then
+            cpu_usage=$(ps -p "$pid" -o %cpu --no-headers 2>/dev/null | tr -d ' ' || echo "N/A")
+            mem_usage=$(ps -p "$pid" -o %mem --no-headers 2>/dev/null | tr -d ' ' || echo "N/A")
+            start_time=$(ps -p "$pid" -o lstart --no-headers 2>/dev/null || echo "N/A")
+        fi
+
+        print_success "端口 $port: 運行中 (PID: $pid)"
+        [[ "$cpu_usage" != "N/A" ]] && echo "  CPU: ${cpu_usage}%"
+        [[ "$mem_usage" != "N/A" ]] && echo "  記憶體: ${mem_usage}%"
+        [[ "$start_time" != "N/A" ]] && echo "  啟動時間: $start_time"
+
+        # 檢查端口狀態
+        if is_port_in_use "$port"; then
+            echo "  端口狀態: 監聽中"
+        else
+            echo "  端口狀態: 未監聽"
+        fi
+
+        return 0
+    else
+        print_warning "端口 $port: 未運行"
+        return 1
+    fi
+}
+# =============================================================================
+# Main Command Functions
+# =============================================================================
+
+# 啟動所有服務
+cmd_start() {
+    print_info "啟動 FramePack 服務..."
+
+    create_directories
+    check_dependencies
+
+    local success=true
+
+    # 啟動主要服務
+    if ! start_instance "${GPU_DEVICES[0]}" "$DEFAULT_PORT" "$USERNAME" "$PASSWORD"; then
+        success=false
+    fi
+
+    # 啟動第二個 GPU 服務（如果啟用）
+    if [[ "$ENABLE_SECOND_GPU" == "true" ]] && [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
+        if ! start_instance "${GPU_DEVICES[1]}" "$SECOND_PORT" "$USERNAME" "$PASSWORD"; then
+            success=false
+        fi
+    fi
+
+    if [[ "$success" == "true" ]]; then
+        print_success "所有服務啟動完成"
+        echo ""
+        print_info "訪問地址:"
+        echo "  主服務: http://localhost:$DEFAULT_PORT"
+        [[ "$ENABLE_SECOND_GPU" == "true" ]] && echo "  第二服務: http://localhost:$SECOND_PORT"
+        echo ""
+        print_info "默認登錄信息:"
+        echo "  用戶名: $USERNAME"
+        echo "  密碼: $PASSWORD"
+    else
+        print_error "部分服務啟動失敗，請檢查日誌"
+        return 1
+    fi
+}
+
+# 停止所有服務
+cmd_stop() {
+    print_info "停止 FramePack 服務..."
+
+    local success=true
+
+    # 停止主要服務
+    if ! stop_instance "$DEFAULT_PORT"; then
+        success=false
+    fi
+
+    # 停止第二個服務
+    if ! stop_instance "$SECOND_PORT"; then
+        success=false
+    fi
+
+    if [[ "$success" == "true" ]]; then
+        print_success "所有服務已停止"
+    else
+        print_error "部分服務停止失敗"
+        return 1
+    fi
+}
+
+# 重啟所有服務
+cmd_restart() {
+    print_info "重啟 FramePack 服務..."
+    cmd_stop
+    sleep 2
+    cmd_start
+}
+
+# 檢查服務狀態
+cmd_status() {
+    print_info "FramePack 服務狀態:"
+    echo ""
+
+    local any_running=false
+
+    # 檢查主要服務
+    if check_instance_status "$DEFAULT_PORT"; then
+        any_running=true
+    fi
+
+    echo ""
+
+    # 檢查第二個服務
+    if check_instance_status "$SECOND_PORT"; then
+        any_running=true
+    fi
+
+    echo ""
+
+    if [[ "$any_running" == "true" ]]; then
+        print_info "系統資源使用情況:"
+        if command -v free >/dev/null 2>&1; then
+            echo "記憶體使用:"
+            free -h | head -2
+        fi
+
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            echo ""
+            echo "GPU 使用情況:"
+            nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+        fi
+    else
+        print_warning "沒有服務在運行"
+    fi
+}
+
+# 顯示幫助信息
+cmd_help() {
+    echo "FramePack Service Manager for Ubuntu 24.04"
+    echo ""
+    echo "用法: $0 [COMMAND]"
+    echo ""
+    echo "命令:"
+    echo "  start     啟動服務"
+    echo "  stop      停止服務"
+    echo "  restart   重啟服務"
+    echo "  status    檢查服務狀態"
+    echo "  help      顯示此幫助信息"
+    echo ""
+    echo "配置:"
+    echo "  工作目錄: $WORK_DIR"
+    echo "  Python: $PYTHON_BIN"
+    echo "  腳本: $SCRIPT_NAME"
+    echo "  主端口: $DEFAULT_PORT"
+    echo "  第二端口: $SECOND_PORT (啟用: $ENABLE_SECOND_GPU)"
+    echo "  GPU 設備: ${GPU_DEVICES[*]}"
+    echo ""
+    echo "文件位置:"
+    echo "  PID 文件: $PID_DIR"
+    echo "  日誌文件: $LOG_DIR"
+    echo "  鎖文件: $LOCK_DIR"
+}
+# =============================================================================
+# Main Execution
+# =============================================================================
+
+# 信號處理
+cleanup() {
+    print_info "接收到終止信號，正在清理..."
+    cmd_stop
+    exit 0
+}
+
+# 設置信號處理
+trap cleanup SIGINT SIGTERM
+
+# 主函數
+main() {
+    local command="${1:-start}"
+
+    case "$command" in
+        start)
+            cmd_start
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        restart)
+            cmd_restart
+            ;;
+        status)
+            cmd_status
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            print_error "未知命令: $command"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+# 檢查是否以 root 身份運行（不建議）
+if [[ $EUID -eq 0 ]]; then
+    print_warning "不建議以 root 身份運行此腳本"
+    read -p "是否繼續？(y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+# 執行主函數
+main "$@"
