@@ -66,12 +66,13 @@ class BaseApp(ABC):
         """是否啟用高級功能（抽象方法）"""
         pass
     
-    def worker(self, input_image, prompt, n_prompt, seed, total_second_length, 
-               latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
-               use_teacache, mp4_crf, resolution, lora_file, lora_multiplier):
+    def worker(self, input_image, prompt, n_prompt, seed, total_second_length,
+               latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
+               use_teacache, mp4_crf, resolution, lora_file, lora_multiplier,
+               use_magcache, magcache_thresh, magcache_K, magcache_retention_ratio):
         """工作線程函數"""
         video_processor = self.get_video_processor()
-        
+
         video_processor.process_video(
             input_image=input_image,
             prompt=prompt,
@@ -89,23 +90,29 @@ class BaseApp(ABC):
             resolution=resolution,
             lora_file=lora_file,
             lora_multiplier=lora_multiplier,
+            use_magcache=use_magcache,
+            magcache_thresh=magcache_thresh,
+            magcache_K=magcache_K,
+            magcache_retention_ratio=magcache_retention_ratio,
             stream=self.stream
         )
     
-    def process(self, input_image, prompt, n_prompt, seed, total_second_length, 
-                latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
-                use_teacache, mp4_crf, resolution, lora_file, lora_multiplier):
+    def process(self, input_image, prompt, n_prompt, seed, total_second_length,
+                latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
+                use_teacache, mp4_crf, resolution, lora_file, lora_multiplier,
+                use_magcache, magcache_thresh, magcache_K, magcache_retention_ratio):
         """處理視頻生成請求"""
         assert input_image is not None, 'No input image!'
-        
+
         yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
-        
+
         self.stream = AsyncStream()
-        
+
         async_run(
-            self.worker, input_image, prompt, n_prompt, seed, total_second_length, 
-            latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
-            use_teacache, mp4_crf, resolution, lora_file, lora_multiplier
+            self.worker, input_image, prompt, n_prompt, seed, total_second_length,
+            latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
+            use_teacache, mp4_crf, resolution, lora_file, lora_multiplier,
+            use_magcache, magcache_thresh, magcache_K, magcache_retention_ratio
         )
         
         output_filename = None

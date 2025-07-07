@@ -9,7 +9,7 @@ from diffusers_helper.gradio.progress_bar import make_progress_bar_css
 
 class UIBuilder:
     """UI 構建器類"""
-    
+
     def __init__(self, app_title: str = "FramePack", high_vram: bool = False):
         self.app_title = app_title
         self.high_vram = high_vram
@@ -18,6 +18,30 @@ class UIBuilder:
             'A character doing some simple body movements.',
         ]
         self.quick_prompts = [[x] for x in self.quick_prompts]
+
+    def handle_magcache_change(self, magcache_value, teacache_value):
+        """
+        Handles the change event for the 'use_magcache' checkbox.
+        Ensures that 'use_teacache' is unchecked if 'use_magcache' is checked.
+        """
+        if magcache_value and teacache_value:
+            # If magcache was just checked AND teacache was already checked,
+            # uncheck teacache.
+            return gr.update(value=True), gr.update(value=False)
+        # Otherwise, return current values to avoid unintended changes
+        return gr.update(value=magcache_value), gr.update(value=teacache_value)
+
+    def handle_teacache_change(self, magcache_value, teacache_value):
+        """
+        Handles the change event for the 'use_teacache' checkbox.
+        Ensures that 'use_magcache' is unchecked if 'use_teacache' is checked.
+        """
+        if magcache_value and teacache_value:
+            # If teacache was just checked AND magcache was already checked,
+            # uncheck magcache.
+            return gr.update(value=False), gr.update(value=True)
+        # Otherwise, return current values to avoid unintended changes
+        return gr.update(value=magcache_value), gr.update(value=teacache_value)
         
     def create_interface(self, 
                         process_fn: Callable,
@@ -97,10 +121,36 @@ class UIBuilder:
     def _create_parameter_group(self, enable_advanced_features: bool) -> dict:
         """創建參數設置組"""
         with gr.Group():
-            use_teacache = gr.Checkbox(
-                label='Use TeaCache', 
-                value=True, 
-                info='Faster speed, but often makes hands and fingers slightly worse.'
+            # Cache options with mutual exclusion
+            with gr.Row():
+                use_magcache = gr.Checkbox(
+                    label='Use MagCache',
+                    value=True,
+                    info='Faster speed, but often makes hands and fingers slightly worse.'
+                )
+                use_teacache = gr.Checkbox(
+                    label='Use TeaCache',
+                    value=False,
+                    info='Faster speed, but often makes hands and fingers slightly worse. Only support MagCache or TeaCache'
+                )
+
+            # MagCache parameters
+            magcache_thresh = gr.Slider(
+                label="MagCache Threshold",
+                minimum=0.0, maximum=1.0, value=0.10, step=0.005,
+                info='Decrease this value when the quality is poor. It denotes the accumulated error caused by skipping steps.'
+            )
+
+            magcache_K = gr.Slider(
+                label="MagCache K",
+                minimum=1, maximum=5, value=3, step=1,
+                info='Decrease this value when the quality is poor. 0 means forbidding magcache.'
+            )
+
+            magcache_retention_ratio = gr.Slider(
+                label="MagCache Retention Ratio",
+                minimum=0.0, maximum=1.0, value=0.2, step=0.01,
+                info='Increase this ratio to make the video more consistent with the video generated without MagCache. Retain the first x% of steps to preserve semantic consistency.'
             )
             
             n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
@@ -158,7 +208,11 @@ class UIBuilder:
             )
         
         return {
+            'use_magcache': use_magcache,
             'use_teacache': use_teacache,
+            'magcache_thresh': magcache_thresh,
+            'magcache_K': magcache_K,
+            'magcache_retention_ratio': magcache_retention_ratio,
             'n_prompt': n_prompt,
             'seed': seed,
             'total_second_length': total_second_length,
@@ -343,7 +397,9 @@ class UIBuilder:
             left_column['seed'], left_column['total_second_length'], left_column['latent_window_size'],
             left_column['steps'], left_column['cfg'], left_column['gs'], left_column['rs'],
             left_column['gpu_memory_preservation'], left_column['use_teacache'], left_column['mp4_crf'],
-            left_column['resolution'], left_column['lora_file'], left_column['lora_multiplier']
+            left_column['resolution'], left_column['lora_file'], left_column['lora_multiplier'],
+            left_column['use_magcache'], left_column['magcache_thresh'], left_column['magcache_K'],
+            left_column['magcache_retention_ratio']
         ]
 
         # 主要處理事件
@@ -358,6 +414,18 @@ class UIBuilder:
         )
 
         left_column['end_button'].click(fn=end_process_fn)
+
+        # MagCache and TeaCache mutual exclusion
+        left_column['use_magcache'].change(
+            fn=self.handle_magcache_change,
+            inputs=[left_column['use_magcache'], left_column['use_teacache']],
+            outputs=[left_column['use_magcache'], left_column['use_teacache']]
+        )
+        left_column['use_teacache'].change(
+            fn=self.handle_teacache_change,
+            inputs=[left_column['use_magcache'], left_column['use_teacache']],
+            outputs=[left_column['use_magcache'], left_column['use_teacache']]
+        )
 
         # 文件管理事件
         self._setup_file_management_events(right_column, file_manager, enable_advanced_features)

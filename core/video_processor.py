@@ -12,18 +12,317 @@ from abc import ABC, abstractmethod
 
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import (
-    save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, 
+    save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw,
     resize_and_center_crop, generate_timestamp
 )
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import (
-    gpu, unload_complete_models, load_model_as_complete, 
-    move_model_to_device_with_memory_preservation, 
+    gpu, unload_complete_models, load_model_as_complete,
+    move_model_to_device_with_memory_preservation,
     offload_model_from_device_for_memory_preservation, fake_diffusers_current_device
 )
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
 from diffusers_helper.gradio.progress_bar import make_progress_bar_html
+from diffusers_helper.models.hunyuan_video_packed import get_cu_seqlens
+
+
+# MagCache utility functions
+def nearest_interp(src_array, target_length):
+    """Nearest neighbor interpolation for MagCache ratios"""
+    src_length = len(src_array)
+    if target_length == 1:
+        return np.array([src_array[-1]])
+
+    scale = (src_length - 1) / (target_length - 1)
+    mapped_indices = np.round(np.arange(target_length) * scale).astype(int)
+    return src_array[mapped_indices]
+
+
+def initialize_magcache(self, enable_magcache=True, num_steps=25, magcache_thresh=0.1, K=2, retention_ratio=0.2):
+    """Initialize MagCache parameters"""
+    self.enable_magcache = enable_magcache
+    self.cnt = 0
+    self.num_steps = num_steps
+    self.magcache_thresh = magcache_thresh
+    self.K = K
+    self.retention_ratio = retention_ratio
+    self.mag_ratios = np.array([1.0]+[1.25781, 1.08594, 1.02344, 1.00781, 1.02344, 1.00781, 1.02344, 1.05469, 0.99609, 1.03906, 1.00781, 1.01562, 1.00781, 1.02344, 1.01562, 0.98047, 1.05469, 0.98047, 0.96875, 1.03125, 0.97266, 0.9375, 0.96484, 0.78516])
+    # Nearest interpolation when the num_steps is different from the length of mag_ratios
+    if len(self.mag_ratios) != num_steps:
+        interpolated_mag_ratios = nearest_interp(self.mag_ratios, num_steps)
+        self.mag_ratios = interpolated_mag_ratios
+
+
+def magcache_framepack_calibration(
+        self,
+        hidden_states, timestep, encoder_hidden_states, encoder_attention_mask, pooled_projections, guidance,
+        latent_indices=None,
+        clean_latents=None, clean_latent_indices=None,
+        clean_latents_2x=None, clean_latent_2x_indices=None,
+        clean_latents_4x=None, clean_latent_4x_indices=None,
+        image_embeddings=None,
+        attention_kwargs=None, return_dict=True
+    ):
+    """
+    Calibration function for `mag_ratios`, requiring only a single prompt/input.
+    Please recalibrate `mag_ratios` if the number of inference steps differs significantly from the predefined value (25),
+    or if the scheduler or solver is modified.
+    """
+    if attention_kwargs is None:
+        attention_kwargs = {}
+
+    batch_size, num_channels, num_frames, height, width = hidden_states.shape
+    p, p_t = self.config['patch_size'], self.config['patch_size_t']
+    post_patch_num_frames = num_frames // p_t
+    post_patch_height = height // p
+    post_patch_width = width // p
+    original_context_length = post_patch_num_frames * post_patch_height * post_patch_width
+
+    hidden_states, rope_freqs = self.process_input_hidden_states(hidden_states, latent_indices, clean_latents, clean_latent_indices, clean_latents_2x, clean_latent_2x_indices, clean_latents_4x, clean_latent_4x_indices)
+
+    temb = self.gradient_checkpointing_method(self.time_text_embed, timestep, guidance, pooled_projections)
+    encoder_hidden_states = self.gradient_checkpointing_method(self.context_embedder, encoder_hidden_states, timestep, encoder_attention_mask)
+
+    if self.image_projection is not None:
+        assert image_embeddings is not None, 'You must use image embeddings!'
+        extra_encoder_hidden_states = self.gradient_checkpointing_method(self.image_projection, image_embeddings)
+        extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
+
+        # must cat before (not after) encoder_hidden_states, due to attn masking
+        encoder_hidden_states = torch.cat([extra_encoder_hidden_states, encoder_hidden_states], dim=1)
+        encoder_attention_mask = torch.cat([extra_attention_mask, encoder_attention_mask], dim=1)
+
+    if batch_size == 1:
+        # When batch size is 1, we do not need any masks or var-len funcs since cropping is mathematically same to what we want
+        # If they are not same, then their impls are wrong. Ours are always the correct one.
+        text_len = encoder_attention_mask.sum().item()
+        encoder_hidden_states = encoder_hidden_states[:, :text_len]
+        attention_mask = None, None, None, None
+    else:
+        img_seq_len = hidden_states.shape[1]
+        txt_seq_len = encoder_hidden_states.shape[1]
+
+        cu_seqlens_q = get_cu_seqlens(encoder_attention_mask, img_seq_len)
+        cu_seqlens_kv = cu_seqlens_q
+        max_seqlen_q = img_seq_len + txt_seq_len
+        max_seqlen_kv = max_seqlen_q
+
+        attention_mask = cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
+
+    if self.cnt == 0 :
+        self.norm_ratio, self.norm_std, self.cos_dis = [], [], []
+
+    ori_hidden_states = hidden_states.clone()
+    for block_id, block in enumerate(self.transformer_blocks):
+        hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+            block,
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            attention_mask,
+            rope_freqs
+        )
+
+    for block_id, block in enumerate(self.single_transformer_blocks):
+        hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+            block,
+            hidden_states,
+            encoder_hidden_states,
+            temb,
+            attention_mask,
+            rope_freqs
+        )
+    cur_residual = hidden_states - ori_hidden_states
+
+    if self.cnt >= 1:
+        norm_ratio = ((cur_residual.norm(dim=-1)/self.previous_residual.norm(dim=-1)).mean()).item()
+        norm_std = (cur_residual.norm(dim=-1)/self.previous_residual.norm(dim=-1)).std().item()
+        cos_dis = (1-torch.nn.functional.cosine_similarity(cur_residual, self.previous_residual, dim=-1, eps=1e-8)).mean().item()
+        self.norm_ratio.append(round(norm_ratio, 5))
+        self.norm_std.append(round(norm_std, 5))
+        self.cos_dis.append(round(cos_dis, 5))
+        print(f"time: {self.cnt}, norm_ratio: {norm_ratio}, norm_std: {norm_std}, cos_dis: {cos_dis}")
+
+    self.previous_residual = cur_residual
+    self.cnt += 1
+    if self.cnt == self.num_steps:
+        print("norm ratio")
+        print(self.norm_ratio)
+        print("norm std")
+        print(self.norm_std)
+        print("cos_dis")
+        print(self.cos_dis)
+        self.cnt = 0
+        self.norm_ratio = []
+        self.norm_std = []
+        self.cos_dis = []
+
+    hidden_states = self.gradient_checkpointing_method(self.norm_out, hidden_states, temb)
+
+    hidden_states = hidden_states[:, -original_context_length:, :]
+
+    if self.high_quality_fp32_output_for_inference:
+        hidden_states = hidden_states.to(dtype=torch.float32)
+        if self.proj_out.weight.dtype != torch.float32:
+            self.proj_out.to(dtype=torch.float32)
+
+    hidden_states = self.gradient_checkpointing_method(self.proj_out, hidden_states)
+
+    hidden_states = einops.rearrange(hidden_states, 'b (t h w) (c pt ph pw) -> b c (t pt) (h ph) (w pw)',
+                                        t=post_patch_num_frames, h=post_patch_height, w=post_patch_width,
+                                        pt=p_t, ph=p, pw=p)
+
+    if return_dict:
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+        return Transformer2DModelOutput(sample=hidden_states)
+
+    return hidden_states,
+
+
+def magcache_framepack_forward(
+        self,
+        hidden_states, timestep, encoder_hidden_states, encoder_attention_mask, pooled_projections, guidance,
+        latent_indices=None,
+        clean_latents=None, clean_latent_indices=None,
+        clean_latents_2x=None, clean_latent_2x_indices=None,
+        clean_latents_4x=None, clean_latent_4x_indices=None,
+        image_embeddings=None,
+        attention_kwargs=None, return_dict=True
+    ):
+    """MagCache optimized forward pass for FramePack"""
+
+    if attention_kwargs is None:
+        attention_kwargs = {}
+
+    batch_size, num_channels, num_frames, height, width = hidden_states.shape
+    p, p_t = self.config['patch_size'], self.config['patch_size_t']
+    post_patch_num_frames = num_frames // p_t
+    post_patch_height = height // p
+    post_patch_width = width // p
+    original_context_length = post_patch_num_frames * post_patch_height * post_patch_width
+
+    hidden_states, rope_freqs = self.process_input_hidden_states(hidden_states, latent_indices, clean_latents, clean_latent_indices, clean_latents_2x, clean_latent_2x_indices, clean_latents_4x, clean_latent_4x_indices)
+
+    temb = self.gradient_checkpointing_method(self.time_text_embed, timestep, guidance, pooled_projections)
+    encoder_hidden_states = self.gradient_checkpointing_method(self.context_embedder, encoder_hidden_states, timestep, encoder_attention_mask)
+
+    if self.image_projection is not None:
+        assert image_embeddings is not None, 'You must use image embeddings!'
+        extra_encoder_hidden_states = self.gradient_checkpointing_method(self.image_projection, image_embeddings)
+        extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
+
+        # must cat before (not after) encoder_hidden_states, due to attn masking
+        encoder_hidden_states = torch.cat([extra_encoder_hidden_states, encoder_hidden_states], dim=1)
+        encoder_attention_mask = torch.cat([extra_attention_mask, encoder_attention_mask], dim=1)
+
+    if batch_size == 1:
+        # When batch size is 1, we do not need any masks or var-len funcs since cropping is mathematically same to what we want
+        # If they are not same, then their impls are wrong. Ours are always the correct one.
+        text_len = encoder_attention_mask.sum().item()
+        encoder_hidden_states = encoder_hidden_states[:, :text_len]
+        attention_mask = None, None, None, None
+    else:
+        img_seq_len = hidden_states.shape[1]
+        txt_seq_len = encoder_hidden_states.shape[1]
+
+        cu_seqlens_q = get_cu_seqlens(encoder_attention_mask, img_seq_len)
+        cu_seqlens_kv = cu_seqlens_q
+        max_seqlen_q = img_seq_len + txt_seq_len
+        max_seqlen_kv = max_seqlen_q
+
+        attention_mask = cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
+
+    if self.enable_magcache:
+        if self.cnt == 0: # initialize MagCache
+            self.accumulated_ratio = 1.0
+            self.accumulated_steps = 0
+            self.accumulated_err = 0
+
+        skip_forward = False
+        if self.cnt>=int(self.retention_ratio*self.num_steps) and self.cnt>=1: # keep first retention_ratio steps
+            cur_mag_ratio = self.mag_ratios[self.cnt]
+            self.accumulated_ratio = self.accumulated_ratio*cur_mag_ratio
+            cur_skip_err = np.abs(1-self.accumulated_ratio)
+            self.accumulated_err += cur_skip_err
+            self.accumulated_steps += 1
+            if self.accumulated_err<=self.magcache_thresh and self.accumulated_steps<=self.K and np.abs(1-cur_mag_ratio)<=0.06:
+                skip_forward = True
+            else:
+                self.accumulated_ratio = 1.0
+                self.accumulated_steps = 0
+                self.accumulated_err = 0
+
+        if skip_forward:
+            hidden_states = hidden_states + self.previous_residual
+        else:
+            ori_hidden_states = hidden_states.clone()
+
+            for block_id, block in enumerate(self.transformer_blocks):
+                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    attention_mask,
+                    rope_freqs
+                )
+
+            for block_id, block in enumerate(self.single_transformer_blocks):
+                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    attention_mask,
+                    rope_freqs
+                )
+
+            self.previous_residual = hidden_states - ori_hidden_states
+        self.cnt += 1
+        if self.cnt == self.num_steps:
+            self.cnt = 0
+    else:
+        for block_id, block in enumerate(self.transformer_blocks):
+            hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                attention_mask,
+                rope_freqs
+            )
+
+        for block_id, block in enumerate(self.single_transformer_blocks):
+            hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                attention_mask,
+                rope_freqs
+            )
+
+    hidden_states = self.gradient_checkpointing_method(self.norm_out, hidden_states, temb)
+
+    hidden_states = hidden_states[:, -original_context_length:, :]
+
+    if self.high_quality_fp32_output_for_inference:
+        hidden_states = hidden_states.to(dtype=torch.float32)
+        if self.proj_out.weight.dtype != torch.float32:
+            self.proj_out.to(dtype=torch.float32)
+
+    hidden_states = self.gradient_checkpointing_method(self.proj_out, hidden_states)
+
+    hidden_states = einops.rearrange(hidden_states, 'b (t h w) (c pt ph pw) -> b c (t pt) (h ph) (w pw)',
+                                        t=post_patch_num_frames, h=post_patch_height, w=post_patch_width,
+                                        pt=p_t, ph=p, pw=p)
+
+    if return_dict:
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+        return Transformer2DModelOutput(sample=hidden_states)
+
+    return hidden_states,
 
 
 class BaseVideoProcessor(ABC):
@@ -34,10 +333,11 @@ class BaseVideoProcessor(ABC):
         self.output_dir = output_dir
         
     @abstractmethod
-    def process_video(self, input_image, prompt, n_prompt, seed, total_second_length, 
-                     latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, 
-                     use_teacache, mp4_crf, resolution, lora_file, lora_multiplier, 
-                     stream, callback_fn: Optional[Callable] = None):
+    def process_video(self, input_image, prompt, n_prompt, seed, total_second_length,
+                     latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
+                     use_teacache, mp4_crf, resolution, lora_file, lora_multiplier,
+                     stream, callback_fn: Optional[Callable] = None, use_magcache=False,
+                     magcache_thresh=0.1, magcache_K=3, magcache_retention_ratio=0.2):
         """處理視頻生成的抽象方法"""
         pass
     
@@ -180,7 +480,8 @@ class FramePackVideoProcessor(BaseVideoProcessor):
     def process_video(self, input_image, prompt, n_prompt, seed, total_second_length,
                      latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                      use_teacache, mp4_crf, resolution, lora_file, lora_multiplier,
-                     stream, callback_fn: Optional[Callable] = None):
+                     stream, callback_fn: Optional[Callable] = None, use_magcache=False,
+                     magcache_thresh=0.1, magcache_K=3, magcache_retention_ratio=0.2):
         """處理 FramePack 視頻生成"""
 
         total_latent_sections = (total_second_length * 24) / (latent_window_size * 4)
@@ -363,7 +664,8 @@ class FramePackF1VideoProcessor(BaseVideoProcessor):
     def process_video(self, input_image, prompt, n_prompt, seed, total_second_length,
                      latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation,
                      use_teacache, mp4_crf, resolution, lora_file, lora_multiplier,
-                     stream, callback_fn: Optional[Callable] = None):
+                     stream, callback_fn: Optional[Callable] = None, use_magcache=False,
+                     magcache_thresh=0.1, magcache_K=3, magcache_retention_ratio=0.2):
         """處理 FramePack F1 視頻生成"""
 
         total_latent_sections = (total_second_length * 24) / (latent_window_size * 4)
@@ -430,10 +732,29 @@ class FramePackF1VideoProcessor(BaseVideoProcessor):
                         preserved_memory_gb=gpu_memory_preservation
                     )
 
-                if use_teacache:
+                # Store original forward method
+                if not hasattr(self.model_manager.transformer, '_orig_forward'):
+                    self.model_manager.transformer._orig_forward = self.model_manager.transformer.__class__.forward
+
+                if use_magcache:
+                    # Apply MagCache monkey patch
+                    self.model_manager.transformer.__class__.forward = magcache_framepack_forward
+                    self.model_manager.transformer.__class__.initialize_magcache = initialize_magcache
+                    self.model_manager.transformer.initialize_magcache(
+                        enable_magcache=True,
+                        num_steps=steps,
+                        magcache_thresh=magcache_thresh,
+                        K=magcache_K,
+                        retention_ratio=magcache_retention_ratio
+                    )
+                elif use_teacache:
+                    self.model_manager.transformer.__class__.forward = self.model_manager.transformer._orig_forward
                     self.model_manager.transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
                 else:
+                    self.model_manager.transformer.__class__.forward = self.model_manager.transformer._orig_forward
+                    self.model_manager.transformer.__class__.initialize_magcache = initialize_magcache
                     self.model_manager.transformer.initialize_teacache(enable_teacache=False)
+                    self.model_manager.transformer.initialize_magcache(enable_magcache=False)
 
                 # 創建回調函數
                 callback = self._create_sampling_callback(stream, steps, total_generated_latent_frames)
