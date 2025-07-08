@@ -6,8 +6,9 @@ import torch
 import numpy as np
 import einops
 import os
+import glob
 from PIL import Image
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, List, Tuple
 from abc import ABC, abstractmethod
 
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
@@ -468,10 +469,61 @@ class BaseVideoProcessor(ABC):
         return callback
     
     def _save_video(self, history_pixels, job_id: str, total_generated_latent_frames: int, mp4_crf: int):
-        """保存視頻文件"""
+        """保存視頻文件並清理舊的較短視頻"""
         output_filename = os.path.join(self.output_dir, f'{job_id}_{total_generated_latent_frames}.mp4')
         save_bcthw_as_mp4(history_pixels, output_filename, fps=24, crf=mp4_crf)
+
+        # 清理同一任務的較短視頻文件
+        self._cleanup_old_videos(job_id, total_generated_latent_frames)
+
         return output_filename
+
+    def _parse_video_filename(self, filename: str) -> Tuple[Optional[str], Optional[int]]:
+        """解析視頻文件名，提取任務ID和幀數信息"""
+        try:
+            # 移除.mp4擴展名
+            name_without_ext = filename.replace('.mp4', '')
+            # 分割文件名，格式假設為: timestamp_jobid_framecount
+            parts = name_without_ext.split('_')
+            if len(parts) >= 3:
+                # 最後一個數字是幀數
+                frame_count = int(parts[-1])
+                # 前面的部分是任務標識符
+                job_id = '_'.join(parts[:-1])
+                return job_id, frame_count
+            return None, None
+        except:
+            return None, None
+
+    def _cleanup_old_videos(self, current_job_id: str, current_frame_count: int):
+        """清理同一任務的較短視頻文件"""
+        try:
+            # 查找輸出目錄中的所有MP4文件
+            mp4_files = glob.glob(os.path.join(self.output_dir, "*.mp4"))
+
+            files_to_delete = []
+            for file_path in mp4_files:
+                filename = os.path.basename(file_path)
+                job_id, frame_count = self._parse_video_filename(filename)
+
+                # 只處理同一任務且幀數較少的文件
+                if (job_id == current_job_id and
+                    frame_count is not None and
+                    frame_count < current_frame_count):
+                    files_to_delete.append((file_path, filename, frame_count))
+
+            # 刪除較短的視頻文件
+            for file_path, filename, frame_count in files_to_delete:
+                try:
+                    file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                    os.remove(file_path)
+                    print(f"✅ 自動清理舊視頻: {filename} ({file_size:.1f}MB, {frame_count} 幀)")
+                except Exception as e:
+                    print(f"⚠️ 清理舊視頻失敗: {filename} - {str(e)}")
+
+        except Exception as e:
+            print(f"⚠️ 自動清理過程中發生錯誤: {str(e)}")
+            # 不拋出異常，避免影響主要的視頻生成流程
 
 
 class FramePackVideoProcessor(BaseVideoProcessor):

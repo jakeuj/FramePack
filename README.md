@@ -22,6 +22,8 @@ This version of FramePack is rendering videos at 24fps.
 
 # News
 
+**2025 Jan 07:** Added automatic cleanup feature - FramePack now automatically removes shorter intermediate videos during generation, saving 60-70% storage space. See [Auto Cleanup Documentation](docs/auto_cleanup_feature.md) for details.
+
 **2025 May 03:** The FramePack-F1 is released. [Try it here.](https://github.com/lllyasviel/FramePack/discussions/459)
 
 Note that this GitHub repository is the only official FramePack website. We do not have any web services. All other websites are spam and fake, including but not limited to `framepack.co`, `frame_pack.co`, `framepack.net`, `frame_pack.net`, `framepack.ai`, `frame_pack.ai`, `framepack.pro`, `frame_pack.pro`, `framepack.cc`, `frame_pack.cc`,`framepackai.co`, `frame_pack_ai.co`, `framepackai.net`, `frame_pack_ai.net`, `framepackai.pro`, `frame_pack_ai.pro`, `framepackai.cc`, `frame_pack_ai.cc`, and so on. Again, they are all spam and fake. **Do not pay money or download files from any of those websites.**
