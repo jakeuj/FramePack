@@ -50,19 +50,31 @@ class UIBuilder:
                         enable_advanced_features: bool = False,
                         add_to_queue_fn: Callable = None,
                         start_queue_fn: Callable = None,
-                        queue_manager_fns: dict = None) -> gr.Blocks:
+                        queue_manager_fns: dict = None,
+                        auth_settings: tuple = None) -> gr.Blocks:
         """創建 Gradio 界面"""
         
         css = make_progress_bar_css()
         block = gr.Blocks(css=css).queue()
         
         with block:
-            gr.Markdown(f'# {self.app_title}')
-            
+            # 頂部標題和用戶信息
+            with gr.Row():
+                with gr.Column(scale=4):
+                    gr.Markdown(f'# {self.app_title}')
+                with gr.Column(scale=1):
+                    if auth_settings:
+                        user_info = gr.Markdown(
+                            f'<div style="text-align: right; margin-top: 20px;">👤 用戶: {auth_settings[0]}</div>',
+                            elem_classes=['user-info']
+                        )
+                    else:
+                        user_info = gr.Markdown('', visible=False)
+
             with gr.Row():
                 # 左側控制面板
                 left_column = self._create_left_column(enable_advanced_features)
-                
+
                 # 右側顯示面板
                 right_column = self._create_right_column(file_manager, enable_advanced_features)
             
@@ -85,18 +97,7 @@ class UIBuilder:
             with gr.Group():
                 gr.Markdown("### 📷 圖片上傳")
 
-                # 單張圖片上傳
-                input_image = gr.Image(sources='upload', type="numpy", label="單張圖片", height=320)
-
-                # 批量圖片上傳
-                batch_images = gr.File(
-                    label="批量上傳圖片",
-                    file_count="multiple",
-                    file_types=["image"],
-                    visible=enable_advanced_features
-                )
-
-                # 上傳模式切換
+                # 上傳模式切換（如果啟用高級功能）
                 if enable_advanced_features:
                     upload_mode = gr.Radio(
                         choices=["單張上傳", "批量上傳"],
@@ -109,6 +110,17 @@ class UIBuilder:
                         value="單張上傳",
                         visible=False
                     )
+
+                # 單張圖片上傳
+                input_image = gr.Image(sources='upload', type="numpy", label="單張圖片", height=320)
+
+                # 批量圖片上傳（默認隱藏，只有在高級功能啟用且選擇批量模式時才顯示）
+                batch_images = gr.File(
+                    label="批量上傳圖片",
+                    file_count="multiple",
+                    file_types=["image"],
+                    visible=False  # 默認隱藏
+                )
 
             resolution = gr.Slider(label="Resolution", minimum=240, maximum=720, value=416, step=16)
             prompt = gr.Textbox(label="Prompt", value='')
@@ -286,7 +298,7 @@ class UIBuilder:
                         headers=["ID", "提示詞", "狀態", "創建時間"],
                         datatype=["str", "str", "str", "str"],
                         label="隊列項目",
-                        height=150,
+                        max_height=150,
                         interactive=False
                     )
 

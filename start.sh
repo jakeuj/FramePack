@@ -153,6 +153,12 @@ load_user_config() {
                 ENABLE_REMOTE)
                     ENABLE_REMOTE="$value"
                     ;;
+                RUN_MODE)
+                    # 只有在命令行沒有設置時才使用配置文件的值
+                    if [[ "$RUN_MODE" == "auto" ]]; then
+                        RUN_MODE="$value"
+                    fi
+                    ;;
                 FORCE_EXTERNAL_ACCESS)
                     FORCE_EXTERNAL_ACCESS="$value"
                     ;;
@@ -176,6 +182,68 @@ load_user_config() {
     SCRIPT_PATH="${WORK_DIR}/${SCRIPT_NAME}"
 }
 
+# 自動檢測運行模式
+detect_run_mode() {
+    # 如果 RUN_MODE 已經明確設定為 local 或 remote，則不自動檢測
+    if [[ "$RUN_MODE" == "local" ]]; then
+        print_info "運行模式已手動設定為: $RUN_MODE"
+        ENABLE_REMOTE=false
+        return 0
+    elif [[ "$RUN_MODE" == "remote" ]]; then
+        print_info "運行模式已手動設定為: $RUN_MODE"
+        ENABLE_REMOTE=true
+        return 0
+    fi
+
+    # 自動檢測模式
+    print_info "自動檢測運行模式..."
+
+    # 檢測方法 1: 檢查當前主機名/IP 是否與 REMOTE_HOST 匹配
+    local current_hostname
+    current_hostname=$(hostname 2>/dev/null || echo "unknown")
+
+    # 檢測方法 2: 檢查當前用戶是否與 REMOTE_USER 匹配
+    local current_user
+    current_user=$(whoami 2>/dev/null || echo "unknown")
+
+    # 檢測方法 3: 檢查當前目錄是否與 REMOTE_PROJECT_DIR 匹配
+    local current_dir
+    current_dir=$(pwd)
+
+    # 檢測方法 4: 檢查是否存在遠端 Python 環境
+    local remote_python_exists=false
+    if [[ -f "$REMOTE_PYTHON" ]]; then
+        remote_python_exists=true
+    fi
+
+    print_info "檢測信息:"
+    print_info "  當前主機名: $current_hostname"
+    print_info "  當前用戶: $current_user"
+    print_info "  當前目錄: $current_dir"
+    print_info "  遠端 Python 存在: $remote_python_exists"
+    print_info "  配置的遠端用戶: $REMOTE_USER"
+    print_info "  配置的遠端目錄: $REMOTE_PROJECT_DIR"
+
+    # 判斷邏輯：如果當前用戶匹配遠端用戶且當前目錄匹配遠端目錄，則認為是在遠端執行
+    if [[ "$current_user" == "$REMOTE_USER" ]] && [[ "$current_dir" == "$REMOTE_PROJECT_DIR" ]] && [[ "$remote_python_exists" == true ]]; then
+        print_success "檢測到在遠端伺服器上執行，自動切換到本地模式"
+        ENABLE_REMOTE=false
+        RUN_MODE="local"
+    else
+        # 如果配置文件中 ENABLE_REMOTE=true，但檢測不到遠端環境，則使用遠端模式
+        if [[ "$ENABLE_REMOTE" == "true" ]]; then
+            print_success "檢測到遠端開發配置，使用遠端模式"
+            RUN_MODE="remote"
+        else
+            print_success "使用本地模式"
+            ENABLE_REMOTE=false
+            RUN_MODE="local"
+        fi
+    fi
+
+    print_info "最終運行模式: $RUN_MODE (ENABLE_REMOTE=$ENABLE_REMOTE)"
+}
+
 # Python 環境設置 (可被配置文件覆蓋)
 LOCAL_VENV_PATH=""
 LOCAL_PYTHON=""
@@ -194,6 +262,9 @@ REMOTE_HOST="192.168.1.104"
 REMOTE_USER="jake"
 REMOTE_PYTHON="/home/jake/.virtualenvs/FramePackB/bin/python"
 REMOTE_PROJECT_DIR="/tmp/pycharm_project_662"
+
+# 運行模式檢測 (可被配置文件或命令行參數覆蓋)
+RUN_MODE="auto"  # auto, local, remote
 
 # 系統配置
 PID_DIR="${WORK_DIR}/pids"
@@ -787,9 +858,6 @@ check_instance_status() {
 cmd_start() {
     print_info "啟動 FramePack 服務..."
 
-    # 載入用戶配置
-    load_user_config
-
     create_directories
     setup_platform_env
     check_dependencies
@@ -872,9 +940,6 @@ cmd_start() {
 
 # 停止所有服務
 cmd_stop() {
-    # 載入用戶配置
-    load_user_config
-
     print_info "停止 FramePack 服務..."
 
     local success=true
@@ -907,9 +972,6 @@ cmd_restart() {
 
 # 檢查服務狀態
 cmd_status() {
-    # 載入用戶配置
-    load_user_config
-
     print_info "FramePack 服務狀態:"
     echo ""
 
@@ -1207,6 +1269,12 @@ LOCAL_PYTHON=$LOCAL_PYTHON
 
 # 是否啟用遠端模式
 ENABLE_REMOTE=$ENABLE_REMOTE
+
+# 運行模式 (auto, local, remote)
+# auto: 自動檢測 (推薦)
+# local: 強制本地模式 (適用於在遠端伺服器上直接執行)
+# remote: 強制遠端模式 (適用於從本機遠端連接)
+RUN_MODE=auto
 EOF
 
     if [[ "$ENABLE_REMOTE" == "true" ]]; then
@@ -1288,13 +1356,15 @@ cmd_clean() {
 
 # 顯示幫助信息
 cmd_help() {
-    # 載入用戶配置以顯示正確的配置信息
-    load_user_config
-
     echo "FramePack Service Manager - 跨平台版本"
     echo "支援 macOS (開發環境) 和 Ubuntu (部署環境)"
     echo ""
-    echo "用法: $0 [COMMAND]"
+    echo "用法: $0 [OPTIONS] [COMMAND]"
+    echo ""
+    echo "選項:"
+    echo "  --local   強制使用本地模式 (禁用遠端連接)"
+    echo "  --remote  強制使用遠端模式 (啟用遠端連接)"
+    echo "  --help    顯示此幫助信息"
     echo ""
     echo "命令:"
     echo "  start     啟動服務 (生產模式)"
@@ -1392,9 +1462,64 @@ cleanup_lock_files() {
 # 設置信號處理
 trap cleanup SIGINT SIGTERM
 
+# 解析命令行參數
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --local)
+                RUN_MODE="local"
+                print_info "強制使用本地模式"
+                shift
+                ;;
+            --remote)
+                RUN_MODE="remote"
+                print_info "強制使用遠端模式"
+                shift
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            -*)
+                print_error "未知參數: $1"
+                cmd_help
+                exit 1
+                ;;
+            *)
+                # 這是命令，停止解析參數
+                break
+                ;;
+        esac
+    done
+}
+
 # 主函數
 main() {
-    local command="${1:-start}"
+    # 解析命令行參數
+    parse_arguments "$@"
+
+    # 載入配置文件（但不自動檢測運行模式）
+    load_user_config
+
+    # 在載入配置後進行運行模式檢測（這樣命令行參數可以覆蓋配置）
+    detect_run_mode
+
+    # 獲取命令（移除已解析的參數後的第一個參數）
+    local command=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --local|--remote)
+                shift
+                ;;
+            *)
+                command="$1"
+                break
+                ;;
+        esac
+    done
+
+    # 如果沒有指定命令，默認為 start
+    command="${command:-start}"
 
     case "$command" in
         start)

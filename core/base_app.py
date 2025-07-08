@@ -306,6 +306,9 @@ class BaseApp(ABC):
             'clear_queue': self.clear_queue
         }
 
+        # 獲取認證設置
+        auth_settings = self.config.get_auth_settings() if hasattr(self.config, 'get_auth_settings') else None
+
         return self.ui_builder.create_interface(
             process_fn=self.process,
             end_process_fn=self.end_process,
@@ -313,7 +316,8 @@ class BaseApp(ABC):
             enable_advanced_features=self.enable_advanced_features(),
             add_to_queue_fn=self.add_to_queue,
             start_queue_fn=self.start_queue_processing,
-            queue_manager_fns=queue_manager_fns
+            queue_manager_fns=queue_manager_fns,
+            auth_settings=auth_settings
         )
     
     def launch(self):
