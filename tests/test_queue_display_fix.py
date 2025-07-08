@@ -84,29 +84,29 @@ def test_queue_display_format():
         if isinstance(queue_items[0], list):
             print("✅ 格式正確: 返回列表的列表")
             
-            # 驗證列數
-            if len(queue_items[0]) == 4:
-                print("✅ 列數正確: 4列 (ID, 提示詞, 狀態, 創建時間)")
-                
+            # 驗證列數 - 手機優化版本只有3列
+            if len(queue_items[0]) == 3:
+                print("✅ 列數正確: 3列 (ID, 狀態, 創建時間) - 手機優化版本")
+
                 # 驗證每列的類型
                 item = queue_items[0]
                 print(f"   - ID: {item[0]} (類型: {type(item[0])})")
-                print(f"   - 提示詞: {item[1]} (類型: {type(item[1])})")
-                print(f"   - 狀態: {item[2]} (類型: {type(item[2])})")
-                print(f"   - 創建時間: {item[3]} (類型: {type(item[3])})")
+                print(f"   - 狀態: {item[1]} (類型: {type(item[1])})")
+                print(f"   - 創建時間: {item[2]} (類型: {type(item[2])})")
                 
-                # 驗證提示詞截斷
-                if len(queue_items) > 1:
-                    long_prompt_item = queue_items[1]
+                # 測試桌面版本（包含提示詞）
+                desktop_items = queue_manager.get_queue_items_with_prompt()
+                if len(desktop_items) > 1:
+                    long_prompt_item = desktop_items[1]
                     if len(long_prompt_item[1]) <= 53:  # 50 + "..."
-                        print("✅ 提示詞截斷功能正常")
+                        print("✅ 提示詞截斷功能正常（桌面版本）")
                     else:
                         print(f"❌ 提示詞截斷失敗: 長度 {len(long_prompt_item[1])}")
-                
-                print("🎉 所有測試通過！隊列顯示格式修復成功！")
+
+                print("🎉 所有測試通過！隊列顯示格式修復成功（手機優化版本）！")
                 return True
             else:
-                print(f"❌ 列數錯誤: 期望4列，實際{len(queue_items[0])}列")
+                print(f"❌ 列數錯誤: 期望3列（手機版），實際{len(queue_items[0])}列")
         else:
             print(f"❌ 格式錯誤: 期望列表，實際{type(queue_items[0])}")
     else:
@@ -150,14 +150,15 @@ def test_gradio_compatibility():
         
         queue_items = queue_manager.get_queue_items()
         
-        # 嘗試創建 Gradio Dataframe（不啟動界面）
+        # 嘗試創建 Gradio Dataframe（不啟動界面）- 手機優化版本
         df = gr.Dataframe(
             value=queue_items,
-            headers=["ID", "提示詞", "狀態", "創建時間"],
-            datatype=["str", "str", "str", "str"],
-            label="隊列項目測試",
+            headers=["ID", "狀態", "創建時間"],  # 手機優化：移除提示詞欄位
+            datatype=["str", "str", "str"],
+            label="隊列項目測試（手機優化）",
             max_height=150,
-            interactive=False
+            interactive=False,
+            elem_classes=["mobile-optimized-queue"]
         )
         
         print("✅ Gradio Dataframe 創建成功")

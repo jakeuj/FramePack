@@ -181,7 +181,21 @@ class ImageProcessingQueue:
             }
     
     def get_queue_items(self) -> List[List[str]]:
-        """獲取隊列項目列表（用於顯示）"""
+        """獲取隊列項目列表（用於顯示）- 手機優化版本，不顯示提示詞"""
+        with self.lock:
+            items = []
+            for item in self.queue:
+                # 返回列表的列表，順序對應 UI 中的 headers: ["ID", "狀態", "創建時間"]
+                # 移除提示詞欄位以優化手機排版
+                items.append([
+                    item.id,
+                    item.status,
+                    time.strftime("%H:%M:%S", time.localtime(item.created_at))
+                ])
+            return items
+
+    def get_queue_items_with_prompt(self) -> List[List[str]]:
+        """獲取包含提示詞的隊列項目列表（用於桌面端顯示）"""
         with self.lock:
             items = []
             for item in self.queue:

@@ -75,6 +75,64 @@ progress::after {
   display: none !important;
 }
 
+/* 手機端優化樣式 */
+@media (max-width: 768px) {
+  /* 隊列表格手機優化 */
+  .mobile-optimized-queue table {
+    font-size: 12px !important;
+  }
+
+  .mobile-optimized-queue th,
+  .mobile-optimized-queue td {
+    padding: 4px 6px !important;
+    word-break: break-word;
+  }
+
+  /* ID欄位縮短顯示 */
+  .mobile-optimized-queue td:first-child {
+    max-width: 80px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* 狀態欄位優化 */
+  .mobile-optimized-queue td:nth-child(2) {
+    max-width: 60px;
+    text-align: center;
+  }
+
+  /* 時間欄位優化 */
+  .mobile-optimized-queue td:nth-child(3) {
+    max-width: 70px;
+    font-size: 11px;
+  }
+
+  /* 按鈕組手機優化 */
+  .gradio-button {
+    font-size: 12px !important;
+    padding: 6px 8px !important;
+    margin: 2px !important;
+  }
+
+  /* 文件管理按鈕優化 */
+  .gradio-row .gradio-button {
+    flex: 1;
+    min-width: 0;
+  }
+}
+
+/* 平板端優化 */
+@media (max-width: 1024px) and (min-width: 769px) {
+  .mobile-optimized-queue table {
+    font-size: 13px !important;
+  }
+
+  .mobile-optimized-queue td:first-child {
+    max-width: 120px;
+  }
+}
+
 '''
 
 

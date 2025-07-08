@@ -289,17 +289,19 @@ class UIBuilder:
     def _create_right_column(self, file_manager, enable_advanced_features: bool) -> dict:
         """創建右側顯示面板"""
         with gr.Column():
-            # 隊列狀態顯示
+            # 隊列狀態顯示 - 手機優化版本
             if enable_advanced_features:
                 with gr.Group():
                     gr.Markdown("### 📋 處理隊列")
                     queue_status = gr.Markdown("隊列狀態: 空")
+                    # 手機優化：移除提示詞欄位，避免過長顯示
                     queue_list = gr.Dataframe(
-                        headers=["ID", "提示詞", "狀態", "創建時間"],
-                        datatype=["str", "str", "str", "str"],
+                        headers=["ID", "狀態", "創建時間"],
+                        datatype=["str", "str", "str"],
                         label="隊列項目",
                         max_height=150,
-                        interactive=False
+                        interactive=False,
+                        elem_classes=["mobile-optimized-queue"]
                     )
 
                     with gr.Row():
@@ -450,16 +452,20 @@ class UIBuilder:
         with gr.Row():
             preview_btn = gr.Button("👁️ 預覽", size="sm", visible=False)
             download_btn = gr.Button("⬇️ 下載", size="sm", visible=False)
+            download_all_btn = gr.Button("📦 下載全部", size="sm", variant="secondary")
 
         preview_video = gr.Video(label="視頻預覽", visible=False, height=300)
         download_file = gr.File(label="下載", visible=False)
+        download_all_file = gr.File(label="批量下載", visible=False)
 
         return {
             'video_selector': video_selector,
             'preview_btn': preview_btn,
             'download_btn': download_btn,
+            'download_all_btn': download_all_btn,
             'preview_video': preview_video,
-            'download_file': download_file
+            'download_file': download_file,
+            'download_all_file': download_all_file
         }
 
     def _setup_event_handlers(self, left_column: dict, right_column: dict,
@@ -571,6 +577,12 @@ class UIBuilder:
             fn=file_manager.download_selected_video,
             inputs=[right_column['video_selector']],
             outputs=[right_column['download_file'], right_column['download_file']]
+        )
+
+        # 批量下載事件
+        right_column['download_all_btn'].click(
+            fn=file_manager.download_all_videos,
+            outputs=[right_column['download_all_file'], right_column['download_all_file']]
         )
 
         # 高級功能事件

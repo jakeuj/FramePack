@@ -4,6 +4,8 @@
 """
 import os
 import glob
+import zipfile
+import tempfile
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional
 import gradio as gr
@@ -54,6 +56,32 @@ class FileManager:
         if selected_file is None:
             return None, gr.update(visible=False)
         return selected_file, gr.update(visible=True)
+
+    def download_all_videos(self) -> Tuple:
+        """批量下載所有視頻文件為ZIP"""
+        mp4_files = glob.glob(os.path.join(self.output_dir, "*.mp4"))
+
+        if not mp4_files:
+            return None, gr.update(visible=False)
+
+        try:
+            # 創建臨時ZIP文件
+            temp_dir = tempfile.gettempdir()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_filename = f"framepack_videos_{timestamp}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for mp4_file in mp4_files:
+                    # 只保留文件名，不包含完整路徑
+                    arcname = os.path.basename(mp4_file)
+                    zipf.write(mp4_file, arcname)
+
+            return zip_path, gr.update(visible=True)
+
+        except Exception as e:
+            print(f"創建ZIP文件時發生錯誤: {str(e)}")
+            return None, gr.update(visible=False)
     
     def parse_video_filename(self, filename: str) -> Tuple[Optional[str], Optional[int]]:
         """解析視頻文件名，提取任務ID和幀數信息"""
