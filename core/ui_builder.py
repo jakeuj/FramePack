@@ -43,11 +43,14 @@ class UIBuilder:
         # Otherwise, return current values to avoid unintended changes
         return gr.update(value=magcache_value), gr.update(value=teacache_value)
         
-    def create_interface(self, 
+    def create_interface(self,
                         process_fn: Callable,
                         end_process_fn: Callable,
                         file_manager,
-                        enable_advanced_features: bool = False) -> gr.Blocks:
+                        enable_advanced_features: bool = False,
+                        add_to_queue_fn: Callable = None,
+                        start_queue_fn: Callable = None,
+                        queue_manager_fns: dict = None) -> gr.Blocks:
         """創建 Gradio 界面"""
         
         css = make_progress_bar_css()
@@ -68,8 +71,9 @@ class UIBuilder:
             
             # 設置事件處理
             self._setup_event_handlers(
-                left_column, right_column, process_fn, end_process_fn, 
-                file_manager, enable_advanced_features
+                left_column, right_column, process_fn, end_process_fn,
+                file_manager, enable_advanced_features, add_to_queue_fn,
+                start_queue_fn, queue_manager_fns
             )
         
         return block
@@ -77,42 +81,73 @@ class UIBuilder:
     def _create_left_column(self, enable_advanced_features: bool) -> dict:
         """創建左側控制面板"""
         with gr.Column():
-            # 基本輸入
-            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            # 圖片上傳區域
+            with gr.Group():
+                gr.Markdown("### 📷 圖片上傳")
+
+                # 單張圖片上傳
+                input_image = gr.Image(sources='upload', type="numpy", label="單張圖片", height=320)
+
+                # 批量圖片上傳
+                batch_images = gr.File(
+                    label="批量上傳圖片",
+                    file_count="multiple",
+                    file_types=["image"],
+                    visible=enable_advanced_features
+                )
+
+                # 上傳模式切換
+                if enable_advanced_features:
+                    upload_mode = gr.Radio(
+                        choices=["單張上傳", "批量上傳"],
+                        value="單張上傳",
+                        label="上傳模式"
+                    )
+                else:
+                    upload_mode = gr.Radio(
+                        choices=["單張上傳"],
+                        value="單張上傳",
+                        visible=False
+                    )
+
             resolution = gr.Slider(label="Resolution", minimum=240, maximum=720, value=416, step=16)
             prompt = gr.Textbox(label="Prompt", value='')
-            
+
             # 快速提示
             example_quick_prompts = gr.Dataset(
-                samples=self.quick_prompts, 
-                label='Quick List', 
-                samples_per_page=1000, 
+                samples=self.quick_prompts,
+                label='Quick List',
+                samples_per_page=1000,
                 components=[prompt]
             )
             example_quick_prompts.click(
-                lambda x: x[0], 
-                inputs=[example_quick_prompts], 
-                outputs=prompt, 
-                show_progress=False, 
+                lambda x: x[0],
+                inputs=[example_quick_prompts],
+                outputs=prompt,
+                show_progress=False,
                 queue=False
             )
-            
+
             # 控制按鈕
             with gr.Row():
-                start_button = gr.Button(value="Start Generation")
-                end_button = gr.Button(value="End Generation", interactive=False)
-            
+                add_to_queue_button = gr.Button(value="添加到隊列", variant="primary")
+                start_queue_button = gr.Button(value="開始處理隊列", variant="secondary")
+                end_button = gr.Button(value="停止處理", interactive=False)
+
             # 參數設置
             params = self._create_parameter_group(enable_advanced_features)
-            
+
             # LoRA 設置
             lora_group = self._create_lora_group()
-        
+
         return {
             'input_image': input_image,
+            'batch_images': batch_images,
+            'upload_mode': upload_mode,
             'resolution': resolution,
             'prompt': prompt,
-            'start_button': start_button,
+            'add_to_queue_button': add_to_queue_button,
+            'start_queue_button': start_queue_button,
             'end_button': end_button,
             **params,
             **lora_group
@@ -242,27 +277,56 @@ class UIBuilder:
     def _create_right_column(self, file_manager, enable_advanced_features: bool) -> dict:
         """創建右側顯示面板"""
         with gr.Column():
+            # 隊列狀態顯示
+            if enable_advanced_features:
+                with gr.Group():
+                    gr.Markdown("### 📋 處理隊列")
+                    queue_status = gr.Markdown("隊列狀態: 空")
+                    queue_list = gr.Dataframe(
+                        headers=["ID", "提示詞", "狀態", "創建時間"],
+                        datatype=["str", "str", "str", "str"],
+                        label="隊列項目",
+                        height=150,
+                        interactive=False
+                    )
+
+                    with gr.Row():
+                        refresh_queue_button = gr.Button("刷新隊列", size="sm")
+                        clear_completed_button = gr.Button("清理已完成", size="sm")
+                        clear_queue_button = gr.Button("清空隊列", size="sm", variant="stop")
+            else:
+                queue_status = gr.Markdown("", visible=False)
+                queue_list = gr.Dataframe(visible=False)
+                refresh_queue_button = gr.Button("", visible=False)
+                clear_completed_button = gr.Button("", visible=False)
+                clear_queue_button = gr.Button("", visible=False)
+
             # 預覽和結果
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
             result_video = gr.Video(
-                label="Finished Frames", 
-                autoplay=True, 
-                show_share_button=False, 
-                height=512, 
+                label="Finished Frames",
+                autoplay=True,
+                show_share_button=False,
+                height=512,
                 loop=True
             )
-            
+
             # 進度顯示
             if not enable_advanced_features:
                 gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
-            
+
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
-            
+
             # 文件管理區域
             file_management = self._create_file_management_section(enable_advanced_features)
-        
+
         return {
+            'queue_status': queue_status,
+            'queue_list': queue_list,
+            'refresh_queue_button': refresh_queue_button,
+            'clear_completed_button': clear_completed_button,
+            'clear_queue_button': clear_queue_button,
             'preview_image': preview_image,
             'result_video': result_video,
             'progress_desc': progress_desc,
@@ -388,32 +452,70 @@ class UIBuilder:
 
     def _setup_event_handlers(self, left_column: dict, right_column: dict,
                              process_fn: Callable, end_process_fn: Callable,
-                             file_manager, enable_advanced_features: bool):
+                             file_manager, enable_advanced_features: bool,
+                             add_to_queue_fn: Callable = None, start_queue_fn: Callable = None,
+                             queue_manager_fns: dict = None):
         """設置事件處理器"""
 
-        # 獲取所有輸入參數
-        input_params = [
-            left_column['input_image'], left_column['prompt'], left_column['n_prompt'],
-            left_column['seed'], left_column['total_second_length'], left_column['latent_window_size'],
-            left_column['steps'], left_column['cfg'], left_column['gs'], left_column['rs'],
-            left_column['gpu_memory_preservation'], left_column['use_teacache'], left_column['mp4_crf'],
-            left_column['resolution'], left_column['lora_file'], left_column['lora_multiplier'],
-            left_column['use_magcache'], left_column['magcache_thresh'], left_column['magcache_K'],
-            left_column['magcache_retention_ratio']
-        ]
+        # 上傳模式切換事件
+        if enable_advanced_features:
+            left_column['upload_mode'].change(
+                fn=self._handle_upload_mode_change,
+                inputs=[left_column['upload_mode']],
+                outputs=[left_column['input_image'], left_column['batch_images']]
+            )
 
-        # 主要處理事件
-        left_column['start_button'].click(
-            fn=process_fn,
-            inputs=input_params,
-            outputs=[
-                right_column['result_video'], right_column['preview_image'],
-                right_column['progress_desc'], right_column['progress_bar'],
-                left_column['start_button'], left_column['end_button']
-            ]
-        )
+        # 隊列管理事件
+        if enable_advanced_features and add_to_queue_fn and start_queue_fn:
+            # 添加到隊列
+            left_column['add_to_queue_button'].click(
+                fn=add_to_queue_fn,
+                inputs=[
+                    left_column['input_image'], left_column['batch_images'], left_column['upload_mode'],
+                    left_column['prompt'], left_column['n_prompt'], left_column['seed'],
+                    left_column['total_second_length'], left_column['latent_window_size'],
+                    left_column['steps'], left_column['cfg'], left_column['gs'], left_column['rs'],
+                    left_column['gpu_memory_preservation'], left_column['use_teacache'],
+                    left_column['mp4_crf'], left_column['resolution'], left_column['lora_file'],
+                    left_column['lora_multiplier'], left_column['use_magcache'],
+                    left_column['magcache_thresh'], left_column['magcache_K'],
+                    left_column['magcache_retention_ratio']
+                ],
+                outputs=[
+                    left_column['input_image'], left_column['batch_images'],
+                    right_column['queue_status'], right_column['queue_list']
+                ]
+            )
+
+            # 開始處理隊列
+            left_column['start_queue_button'].click(
+                fn=start_queue_fn,
+                outputs=[
+                    right_column['result_video'], right_column['preview_image'],
+                    right_column['progress_desc'], right_column['progress_bar'],
+                    left_column['start_queue_button'], left_column['end_button'],
+                    right_column['queue_status'], right_column['queue_list']
+                ]
+            )
 
         left_column['end_button'].click(fn=end_process_fn)
+
+        # 隊列管理按鈕事件
+        if enable_advanced_features and queue_manager_fns:
+            right_column['refresh_queue_button'].click(
+                fn=queue_manager_fns.get('refresh_queue'),
+                outputs=[right_column['queue_status'], right_column['queue_list']]
+            )
+
+            right_column['clear_completed_button'].click(
+                fn=queue_manager_fns.get('clear_completed'),
+                outputs=[right_column['queue_status'], right_column['queue_list']]
+            )
+
+            right_column['clear_queue_button'].click(
+                fn=queue_manager_fns.get('clear_queue'),
+                outputs=[right_column['queue_status'], right_column['queue_list']]
+            )
 
         # MagCache and TeaCache mutual exclusion
         left_column['use_magcache'].change(
@@ -518,3 +620,11 @@ class UIBuilder:
             fn=lambda: [gr.update(visible=False, value=""), gr.update(visible=False), gr.update(visible=False)],
             outputs=[right_column['delete_all_preview_display'], right_column['delete_all_execute_btn'], right_column['delete_all_cancel_btn']]
         )
+
+    @staticmethod
+    def _handle_upload_mode_change(upload_mode):
+        """處理上傳模式切換"""
+        if upload_mode == "單張上傳":
+            return gr.update(visible=True), gr.update(visible=False)
+        else:  # 批量上傳
+            return gr.update(visible=False), gr.update(visible=True)
