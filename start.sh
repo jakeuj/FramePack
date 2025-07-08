@@ -451,7 +451,7 @@ is_process_running() {
 
     # 清理 PID 並檢查是否為有效數字
     local clean_pid
-    clean_pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]*')
+    clean_pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]\+')
 
     # 檢查清理後的 PID 是否有效
     [[ -n "$clean_pid" ]] && [[ "$clean_pid" -gt 0 ]] 2>/dev/null && kill -0 "$clean_pid" 2>/dev/null
@@ -589,11 +589,11 @@ start_local_instance() {
     local pid=$!
 
     # 清理 PID 變數中的任何不可見字符
-    pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]*')
+    pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]\+')
 
     # 檢查 PID 是否有效
     if [[ -z "$pid" ]] || [[ "$pid" -eq 0 ]] 2>/dev/null; then
-        print_error "無法獲取有效的進程 PID"
+        print_error "無法獲取有效的進程 PID (原始 PID: $!)"
         rm -f "$lock_file"
         return 1
     fi
