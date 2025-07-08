@@ -180,18 +180,18 @@ class ImageProcessingQueue:
                 "current_processing": self.current_processing.id if self.current_processing else None
             }
     
-    def get_queue_items(self) -> List[Dict[str, Any]]:
+    def get_queue_items(self) -> List[List[str]]:
         """獲取隊列項目列表（用於顯示）"""
         with self.lock:
             items = []
             for item in self.queue:
-                items.append({
-                    "id": item.id,
-                    "prompt": item.prompt[:50] + "..." if len(item.prompt) > 50 else item.prompt,
-                    "status": item.status,
-                    "created_at": time.strftime("%H:%M:%S", time.localtime(item.created_at)),
-                    "output_file": item.output_file
-                })
+                # 返回列表的列表，順序對應 UI 中的 headers: ["ID", "提示詞", "狀態", "創建時間"]
+                items.append([
+                    item.id,
+                    item.prompt[:50] + "..." if len(item.prompt) > 50 else item.prompt,
+                    item.status,
+                    time.strftime("%H:%M:%S", time.localtime(item.created_at))
+                ])
             return items
     
     def is_empty(self) -> bool:
