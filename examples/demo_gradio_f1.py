@@ -1,0 +1,863 @@
+from diffusers_helper.hf_login import login
+
+import os
+import glob
+from datetime import datetime
+
+os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+import gradio as gr
+import torch
+import traceback
+import einops
+import safetensors.torch as sf
+import numpy as np
+import argparse
+import math
+import gc
+import time
+
+from PIL import Image
+from diffusers import AutoencoderKLHunyuanVideo
+from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
+from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
+from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
+from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
+from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.thread_utils import AsyncStream, async_run
+from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
+from transformers import SiglipImageProcessor, SiglipVisionModel
+from diffusers_helper.clip_vision import hf_clip_vision_encode
+from diffusers_helper.bucket_tools import find_nearest_bucket
+from utils.lora_utils import merge_lora_to_state_dict
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--share', action='store_true')
+parser.add_argument("--server", type=str, default='0.0.0.0')
+parser.add_argument("--port", type=int, required=False)
+parser.add_argument("--inbrowser", action='store_true')
+parser.add_argument("--output_dir", type=str, default='./outputs')
+parser.add_argument("--username", type=str, default='admin', help='认证用户名 (默认: admin)')
+parser.add_argument("--password", type=str, default='123456', help='认证密码 (默认: 123456)')
+parser.add_argument("--no-auth", action='store_true', help='禁用认证')
+args = parser.parse_args()
+
+# for win desktop probably use --server 127.0.0.1 --inbrowser
+# For linux server probably use --server 127.0.0.1 or do not use any cmd flags
+
+print(args)
+
+# 设置认证
+auth_settings = None
+if not args.no_auth:
+    auth_settings = (args.username, args.password)
+    print(f'启用认证 - 用户名: {args.username}, 密码: {"*" * len(args.password)}')
+else:
+    print('认证已禁用')
+
+if torch.cuda.is_available():
+    free_mem_gb = get_cuda_free_memory_gb(gpu)
+else:
+    free_mem_gb = torch.mps.recommended_max_memory() / 1024 / 1024 / 1024
+
+high_vram = free_mem_gb > 60
+
+print(f'Free VRAM {free_mem_gb} GB')
+print(f'High-VRAM Mode: {high_vram}')
+
+text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
+text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
+tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
+tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
+vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+
+feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
+image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+
+transformer = None  # load later
+transformer_dtype = torch.bfloat16
+previous_lora_file = None
+previous_lora_multiplier = None
+
+vae.eval()
+text_encoder.eval()
+text_encoder_2.eval()
+image_encoder.eval()
+
+if not high_vram:
+    vae.enable_slicing()
+    vae.enable_tiling()
+
+vae.to(dtype=torch.float16)
+image_encoder.to(dtype=torch.float16)
+text_encoder.to(dtype=torch.float16)
+text_encoder_2.to(dtype=torch.float16)
+
+vae.requires_grad_(False)
+text_encoder.requires_grad_(False)
+text_encoder_2.requires_grad_(False)
+image_encoder.requires_grad_(False)
+
+if not high_vram:
+    # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
+    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+else:
+    text_encoder.to(gpu)
+    text_encoder_2.to(gpu)
+    image_encoder.to(gpu)
+    vae.to(gpu)
+
+stream = AsyncStream()
+
+outputs_folder = args.output_dir
+os.makedirs(outputs_folder, exist_ok=True)
+
+
+@torch.no_grad()
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier):
+    global transformer, previous_lora_file, previous_lora_multiplier
+
+    model_changed = transformer is None or (
+        lora_file != previous_lora_file
+        or lora_multiplier != previous_lora_multiplier
+    )
+
+    total_latent_sections = (total_second_length * 24) / (latent_window_size * 4)
+    total_latent_sections = int(max(round(total_latent_sections), 1))
+
+    job_id = generate_timestamp()
+
+    stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+
+    try:
+        # Clean GPU
+        if not high_vram:
+            unload_complete_models(
+                text_encoder, text_encoder_2, image_encoder, vae, transformer
+            )
+
+        # Text encoding
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
+
+        if not high_vram:
+            fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
+            load_model_as_complete(text_encoder_2, target_device=gpu)
+
+        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+        if cfg == 1:
+            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+        else:
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+        # Processing input image
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
+
+        H, W, C = input_image.shape
+        height, width = find_nearest_bucket(H, W, resolution=resolution)
+        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+
+        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+
+        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
+        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+
+        # VAE encoding
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
+
+        if not high_vram:
+            load_model_as_complete(vae, target_device=gpu)
+
+        start_latent = vae_encode(input_image_pt, vae)
+
+        # CLIP Vision
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
+
+        if not high_vram:
+            load_model_as_complete(image_encoder, target_device=gpu)
+
+        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+
+        # Dtype
+
+        llama_vec = llama_vec.to(transformer_dtype)
+        llama_vec_n = llama_vec_n.to(transformer_dtype)
+        clip_l_pooler = clip_l_pooler.to(transformer_dtype)
+        clip_l_pooler_n = clip_l_pooler_n.to(transformer_dtype)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer_dtype)
+
+        # Load transformer model
+        if model_changed:
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Loading transformer ...'))))
+
+            transformer = None
+            time.sleep(1.0)  # wait for the previous model to be unloaded
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            previous_lora_file = lora_file
+            previous_lora_multiplier = lora_multiplier
+
+            transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
+            transformer.eval()
+            transformer.high_quality_fp32_output_for_inference = True
+            print('transformer.high_quality_fp32_output_for_inference = True')
+
+            transformer.to(dtype=torch.bfloat16)
+            transformer.requires_grad_(False)
+
+            if lora_file is not None:
+                state_dict = transformer.state_dict()
+                print(f"Merging LoRA file {os.path.basename(lora_file)} ...")
+                state_dict = merge_lora_to_state_dict(state_dict, lora_file, lora_multiplier, device=gpu)
+                gc.collect()
+                info = transformer.load_state_dict(state_dict, strict=True, assign=True)
+                print(f"LoRA applied: {info}")
+
+            if not high_vram:
+                DynamicSwapInstaller.install_model(transformer, device=gpu)
+            else:
+                transformer.to(gpu)
+
+        # Sampling
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
+
+        rnd = torch.Generator("cpu").manual_seed(seed)
+
+        history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, height // 8, width // 8), dtype=torch.float32).cpu()
+        history_pixels = None
+
+        history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2)
+        total_generated_latent_frames = 1
+
+        for section_index in range(total_latent_sections):
+            if stream.input_queue.top() == 'end':
+                stream.output_queue.push(('end', None))
+                return
+
+            print(f'section_index = {section_index}, total_latent_sections = {total_latent_sections}')
+
+            if not high_vram:
+                unload_complete_models()
+                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+
+            if use_teacache:
+                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
+
+            def callback(d):
+                preview = d['denoised']
+                preview = vae_decode_fake(preview)
+
+                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
+
+                if stream.input_queue.top() == 'end':
+                    stream.output_queue.push(('end', None))
+                    raise KeyboardInterrupt('User ends the task.')
+
+                current_step = d['i'] + 1
+                percentage = int(100.0 * current_step / steps)
+                hint = f'Sampling {current_step}/{steps}'
+                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 24) :.2f} seconds (FPS-24). The video is being extended now ...'
+                stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                return
+
+            indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
+            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+
+            clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
+            clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
+
+            generated_latents = sample_hunyuan(
+                transformer=transformer,
+                sampler='unipc',
+                width=width,
+                height=height,
+                frames=latent_window_size * 4 - 3,
+                real_guidance_scale=cfg,
+                distilled_guidance_scale=gs,
+                guidance_rescale=rs,
+                # shift=3.0,
+                num_inference_steps=steps,
+                generator=rnd,
+                prompt_embeds=llama_vec,
+                prompt_embeds_mask=llama_attention_mask,
+                prompt_poolers=clip_l_pooler,
+                negative_prompt_embeds=llama_vec_n,
+                negative_prompt_embeds_mask=llama_attention_mask_n,
+                negative_prompt_poolers=clip_l_pooler_n,
+                device=gpu,
+                dtype=transformer.dtype,
+                image_embeddings=image_encoder_last_hidden_state,
+                latent_indices=latent_indices,
+                clean_latents=clean_latents,
+                clean_latent_indices=clean_latent_indices,
+                clean_latents_2x=clean_latents_2x,
+                clean_latent_2x_indices=clean_latent_2x_indices,
+                clean_latents_4x=clean_latents_4x,
+                clean_latent_4x_indices=clean_latent_4x_indices,
+                callback=callback,
+            )
+
+            total_generated_latent_frames += int(generated_latents.shape[2])
+            history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
+
+            if not high_vram:
+                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                load_model_as_complete(vae, target_device=gpu)
+
+            real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+
+            if history_pixels is None:
+                history_pixels = vae_decode(real_history_latents, vae).cpu()
+            else:
+                section_latent_frames = latent_window_size * 2
+                overlapped_frames = latent_window_size * 4 - 3
+
+                current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
+                history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
+
+            if not high_vram:
+                unload_complete_models()
+
+            output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
+
+            save_bcthw_as_mp4(history_pixels, output_filename, fps=24, crf=mp4_crf)
+
+            print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
+
+            stream.output_queue.push(('file', output_filename))
+    except:
+        traceback.print_exc()
+
+        if not high_vram:
+            unload_complete_models(
+                text_encoder, text_encoder_2, image_encoder, vae, transformer
+            )
+
+    stream.output_queue.push(('end', None))
+    return
+
+
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier):
+    global stream
+    assert input_image is not None, 'No input image!'
+
+    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+
+    stream = AsyncStream()
+
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier)
+
+    output_filename = None
+
+    while True:
+        flag, data = stream.output_queue.next()
+
+        if flag == 'file':
+            output_filename = data
+            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+
+        if flag == 'progress':
+            preview, desc, html = data
+            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+
+        if flag == 'end':
+            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+            break
+
+
+def end_process():
+    stream.input_queue.push('end')
+
+
+def get_output_videos():
+    """获取输出文件夹中的所有MP4文件"""
+    mp4_files = glob.glob(os.path.join(outputs_folder, "*.mp4"))
+    if not mp4_files:
+        return (
+            "没有找到任何视频文件", 
+            gr.update(choices=[], value=None, visible=False), 
+            gr.update(visible=False),  # preview_btn
+            gr.update(visible=False),  # download_btn
+            gr.update(visible=False)   # preview_video
+        )
+    
+    # 按修改时间排序，最新的在前
+    mp4_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    
+    # 创建文件信息列表
+    file_info = []
+    file_choices = []
+    for file_path in mp4_files:
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+        mod_time = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M:%S")
+        file_info.append(f"📹 {filename} ({file_size:.1f}MB) - {mod_time}")
+        file_choices.append(file_path)
+    
+    file_list_text = "\n".join(file_info)
+    return (
+        file_list_text, 
+        gr.update(choices=file_choices, value=file_choices[0] if file_choices else None, visible=True), 
+        gr.update(visible=True),   # preview_btn
+        gr.update(visible=True),   # download_btn
+        gr.update(visible=False)   # preview_video (隐藏直到用户点击预览)
+    )
+
+
+def parse_video_filename(filename):
+    """解析视频文件名，提取任务ID和帧数信息"""
+    try:
+        # 移除.mp4扩展名
+        name_without_ext = filename.replace('.mp4', '')
+        # 分割文件名，格式假设为: timestamp_jobid_framecount
+        parts = name_without_ext.split('_')
+        if len(parts) >= 3:
+            # 最后一个数字是帧数
+            frame_count = int(parts[-1])
+            # 前面的部分是任务标识符
+            job_id = '_'.join(parts[:-1])
+            return job_id, frame_count
+        return None, None
+    except:
+        return None, None
+
+
+def get_cleanup_preview():
+    """获取清理预览信息"""
+    mp4_files = glob.glob(os.path.join(outputs_folder, "*.mp4"))
+    if not mp4_files:
+        return "没有找到任何视频文件", gr.update(visible=False)
+    
+    # 按任务分组
+    job_groups = {}
+    for file_path in mp4_files:
+        filename = os.path.basename(file_path)
+        job_id, frame_count = parse_video_filename(filename)
+        
+        if job_id and frame_count is not None:
+            if job_id not in job_groups:
+                job_groups[job_id] = []
+            job_groups[job_id].append((file_path, frame_count, filename))
+    
+    if not job_groups:
+        return "没有找到有效的视频文件", gr.update(visible=False)
+    
+    # 生成清理预览
+    preview_info = []
+    total_to_delete = 0
+    total_size_to_free = 0
+    
+    for job_id, files in job_groups.items():
+        if len(files) <= 1:
+            continue  # 只有一个文件的任务不需要清理
+        
+        # 按帧数排序，帧数最大的是最新最长的
+        files.sort(key=lambda x: x[1], reverse=True)
+        latest_file = files[0]
+        files_to_delete = files[1:]
+        
+        preview_info.append(f"📂 任务: {job_id}")
+        preview_info.append(f"  ✅ 保留: {latest_file[2]} ({latest_file[1]} 帧)")
+        
+        for file_path, frame_count, filename in files_to_delete:
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+            preview_info.append(f"  ❌ 删除: {filename} ({frame_count} 帧, {file_size:.1f}MB)")
+            total_to_delete += 1
+            total_size_to_free += file_size
+        
+        preview_info.append("")  # 空行分隔
+    
+    if total_to_delete == 0:
+        return "没有需要清理的文件（每个任务都只有一个视频文件）", gr.update(visible=False)
+    
+    summary = f"总计将删除 {total_to_delete} 个文件，释放约 {total_size_to_free:.1f}MB 空间\n\n"
+    preview_text = summary + "\n".join(preview_info)
+    
+    return preview_text, gr.update(visible=True)
+
+
+def cleanup_videos():
+    """执行视频清理"""
+    mp4_files = glob.glob(os.path.join(outputs_folder, "*.mp4"))
+    if not mp4_files:
+        return "没有找到任何视频文件", "❌ 清理失败"
+    
+    # 按任务分组
+    job_groups = {}
+    for file_path in mp4_files:
+        filename = os.path.basename(file_path)
+        job_id, frame_count = parse_video_filename(filename)
+        
+        if job_id and frame_count is not None:
+            if job_id not in job_groups:
+                job_groups[job_id] = []
+            job_groups[job_id].append((file_path, frame_count, filename))
+    
+    if not job_groups:
+        return "没有找到有效的视频文件", "❌ 清理失败"
+    
+    # 执行清理
+    deleted_count = 0
+    deleted_size = 0
+    result_info = []
+    
+    try:
+        for job_id, files in job_groups.items():
+            if len(files) <= 1:
+                continue  # 只有一个文件的任务不需要清理
+            
+            # 按帧数排序，帧数最大的是最新最长的
+            files.sort(key=lambda x: x[1], reverse=True)
+            latest_file = files[0]
+            files_to_delete = files[1:]
+            
+            result_info.append(f"📂 任务: {job_id}")
+            result_info.append(f"  ✅ 保留: {latest_file[2]}")
+            
+            for file_path, frame_count, filename in files_to_delete:
+                try:
+                    file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                    os.remove(file_path)
+                    result_info.append(f"  ✅ 已删除: {filename} ({file_size:.1f}MB)")
+                    deleted_count += 1
+                    deleted_size += file_size
+                except Exception as e:
+                    result_info.append(f"  ❌ 删除失败: {filename} - {str(e)}")
+            
+            result_info.append("")  # 空行分隔
+        
+        if deleted_count == 0:
+            return "没有需要清理的文件", "ℹ️ 无需清理"
+        
+        summary = f"✅ 清理完成！共删除 {deleted_count} 个文件，释放了 {deleted_size:.1f}MB 空间\n\n"
+        result_text = summary + "\n".join(result_info)
+        
+        return result_text, "✅ 清理成功"
+        
+    except Exception as e:
+        return f"清理过程中发生错误: {str(e)}", "❌ 清理失败"
+
+
+def get_all_files_preview():
+    """获取所有文件的删除预览"""
+    # 支持的文件类型
+    file_patterns = ["*.mp4", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.webp"]
+    
+    all_files = []
+    for pattern in file_patterns:
+        all_files.extend(glob.glob(os.path.join(outputs_folder, pattern)))
+    
+    if not all_files:
+        return "输出文件夹中没有找到任何文件", gr.update(visible=False)
+    
+    # 按文件类型分组统计
+    file_stats = {}
+    total_size = 0
+    
+    for file_path in all_files:
+        filename = os.path.basename(file_path)
+        file_ext = os.path.splitext(filename)[1].lower()
+        file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+        
+        if file_ext not in file_stats:
+            file_stats[file_ext] = {"count": 0, "size": 0, "files": []}
+        
+        file_stats[file_ext]["count"] += 1
+        file_stats[file_ext]["size"] += file_size
+        file_stats[file_ext]["files"].append((filename, file_size))
+        total_size += file_size
+    
+    # 生成预览信息
+    preview_info = []
+    preview_info.append("⚠️ 警告：此操作将删除输出文件夹中的所有文件！")
+    preview_info.append(f"📊 总计: {len(all_files)} 个文件，约 {total_size:.1f}MB")
+    preview_info.append("")
+    
+    for file_ext, stats in sorted(file_stats.items()):
+        preview_info.append(f"📄 {file_ext.upper() if file_ext else '无扩展名'} 文件: {stats['count']} 个，{stats['size']:.1f}MB")
+        
+        # 显示文件列表（如果文件太多只显示前10个）
+        files_to_show = stats['files'][:10]
+        for filename, file_size in files_to_show:
+            preview_info.append(f"   • {filename} ({file_size:.1f}MB)")
+        
+        if len(stats['files']) > 10:
+            preview_info.append(f"   ... 还有 {len(stats['files']) - 10} 个文件")
+        
+        preview_info.append("")
+    
+    preview_text = "\n".join(preview_info)
+    return preview_text, gr.update(visible=True)
+
+
+def delete_all_files():
+    """删除所有文件"""
+    # 支持的文件类型
+    file_patterns = ["*.mp4", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.webp"]
+    
+    all_files = []
+    for pattern in file_patterns:
+        all_files.extend(glob.glob(os.path.join(outputs_folder, pattern)))
+    
+    if not all_files:
+        return "输出文件夹中没有找到任何文件", "ℹ️ 无文件可删除"
+    
+    # 执行删除
+    deleted_count = 0
+    failed_count = 0
+    total_size_freed = 0
+    result_info = []
+    
+    try:
+        result_info.append("🗑️ 开始删除所有文件...")
+        result_info.append("")
+        
+        for file_path in all_files:
+            filename = os.path.basename(file_path)
+            try:
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                os.remove(file_path)
+                result_info.append(f"✅ 已删除: {filename} ({file_size:.1f}MB)")
+                deleted_count += 1
+                total_size_freed += file_size
+            except Exception as e:
+                result_info.append(f"❌ 删除失败: {filename} - {str(e)}")
+                failed_count += 1
+        
+        result_info.append("")
+        
+        if deleted_count > 0:
+            summary = f"✅ 删除完成！\n"
+            summary += f"• 成功删除: {deleted_count} 个文件\n"
+            if failed_count > 0:
+                summary += f"• 删除失败: {failed_count} 个文件\n"
+            summary += f"• 释放空间: {total_size_freed:.1f}MB\n\n"
+            
+            result_text = summary + "\n".join(result_info)
+            status = "✅ 删除完成"
+        else:
+            result_text = "❌ 没有成功删除任何文件\n\n" + "\n".join(result_info)
+            status = "❌ 删除失败"
+        
+        return result_text, status
+        
+    except Exception as e:
+        return f"删除过程中发生严重错误: {str(e)}", "❌ 删除失败"
+
+
+def download_selected_video(selected_file):
+    """处理视频文件下载"""
+    if selected_file is None:
+        return None, gr.update(visible=False)
+    return selected_file, gr.update(visible=True)
+
+
+quick_prompts = [
+    'The girl dances gracefully, with clear movements, full of charm.',
+    'A character doing some simple body movements.',
+]
+quick_prompts = [[x] for x in quick_prompts]
+
+
+css = make_progress_bar_css()
+block = gr.Blocks(css=css).queue()
+with block:
+    gr.Markdown('# FramePack-F1')
+    with gr.Row():
+        with gr.Column():
+            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            resolution = gr.Slider(label="Resolution", minimum=240, maximum=720, value=416, step=16)
+            prompt = gr.Textbox(label="Prompt", value='')
+            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
+            example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
+
+            with gr.Row():
+                start_button = gr.Button(value="Start Generation")
+                end_button = gr.Button(value="End Generation", interactive=False)
+
+            with gr.Group():
+                use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+
+                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
+                seed = gr.Number(label="Seed", value=31337, precision=0)
+
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=120, step=0.1)
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
+                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
+
+                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
+                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
+                rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
+
+                # This is only used when high_vram is False
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.", visible=not high_vram)
+
+                mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
+
+            with gr.Group():
+                lora_file = gr.File(label="LoRA File", file_count="single", type="filepath")
+                lora_multiplier = gr.Slider(label="LoRA Multiplier", minimum=0.0, maximum=1.0, value=0.8, step=0.1)
+
+        with gr.Column():
+            preview_image = gr.Image(label="Next Latents", height=200, visible=False)
+            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
+            progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
+            progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+            
+            # 视频文件管理区域
+            with gr.Group():
+                gr.Markdown("### 📁 输出视频管理")
+                gr.Markdown("💡 **清理功能说明**:")
+                gr.Markdown("• **智能清理**: 对于每个生成任务，只保留最长的视频文件，删除中间生成的较短文件")
+                gr.Markdown("• **全部删除**: ⚠️ 删除输出文件夹中的所有文件（MP4、PNG、JPG等），操作前请仔细确认")
+                with gr.Row():
+                    refresh_btn = gr.Button("🔄 刷新列表", size="sm")
+                    cleanup_preview_btn = gr.Button("🗂️ 清理预览", size="sm")
+                    delete_all_preview_btn = gr.Button("🗑️ 全部删除预览", variant="stop", size="sm")
+                
+                video_list_display = gr.Textbox(
+                    label="视频文件列表", 
+                    lines=6, 
+                    interactive=False,
+                    placeholder="点击刷新按钮查看视频文件..."
+                )
+                
+                # 清理预览区域
+                cleanup_preview_display = gr.Textbox(
+                    label="清理预览", 
+                    lines=8, 
+                    interactive=False,
+                    visible=False,
+                    placeholder="点击清理预览按钮查看将要删除的文件..."
+                )
+                
+                cleanup_execute_btn = gr.Button("🗑️ 执行清理", variant="stop", size="sm", visible=False)
+                cleanup_status = gr.Textbox(label="清理状态", visible=False, interactive=False)
+                
+                # 全部删除区域
+                delete_all_preview_display = gr.Textbox(
+                    label="全部删除预览", 
+                    lines=10, 
+                    interactive=False,
+                    visible=False,
+                    placeholder="点击全部删除预览按钮查看将要删除的所有文件..."
+                )
+                
+                with gr.Row():
+                    delete_all_execute_btn = gr.Button("⚠️ 确认删除全部文件", variant="stop", size="sm", visible=False)
+                    delete_all_cancel_btn = gr.Button("❌ 取消", size="sm", visible=False)
+                
+                delete_all_status = gr.Textbox(label="删除状态", visible=False, interactive=False)
+                
+                with gr.Row():
+                    video_selector = gr.Dropdown(
+                        label="选择视频",
+                        choices=[],
+                        visible=False
+                    )
+                
+                with gr.Row():
+                    preview_btn = gr.Button("👁️ 预览", size="sm", visible=False)
+                    download_btn = gr.Button("⬇️ 下载", size="sm", visible=False)
+                
+                preview_video = gr.Video(label="视频预览", visible=False, height=300)
+                download_file = gr.File(label="下载", visible=False)
+
+    gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
+
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, resolution, lora_file, lora_multiplier]
+    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+    end_button.click(fn=end_process)
+    
+    # 视频文件管理事件处理
+    refresh_btn.click(
+        fn=get_output_videos,
+        outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
+    )
+    
+    # 清理预览事件
+    cleanup_preview_btn.click(
+        fn=get_cleanup_preview,
+        outputs=[cleanup_preview_display, cleanup_execute_btn]
+    )
+    
+    # 执行清理事件
+    cleanup_execute_btn.click(
+        fn=cleanup_videos,
+        outputs=[cleanup_preview_display, cleanup_status]
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        outputs=[cleanup_status]
+    ).then(
+        fn=get_output_videos,  # 清理后自动刷新文件列表
+        outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
+    )
+    
+    # 全部删除预览事件
+    delete_all_preview_btn.click(
+        fn=get_all_files_preview,
+        outputs=[delete_all_preview_display, delete_all_execute_btn]
+    ).then(
+        fn=lambda: [gr.update(visible=True), gr.update(visible=True)],
+        outputs=[delete_all_cancel_btn, delete_all_preview_display]
+    )
+    
+    # 执行全部删除事件
+    delete_all_execute_btn.click(
+        fn=delete_all_files,
+        outputs=[delete_all_preview_display, delete_all_status]
+    ).then(
+        fn=lambda: [gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)],
+        outputs=[delete_all_status, delete_all_execute_btn, delete_all_cancel_btn]
+    ).then(
+        fn=get_output_videos,  # 删除后自动刷新文件列表
+        outputs=[video_list_display, video_selector, preview_btn, download_btn, preview_video]
+    )
+    
+    # 取消全部删除事件
+    delete_all_cancel_btn.click(
+        fn=lambda: [gr.update(visible=False, value=""), gr.update(visible=False), gr.update(visible=False)],
+        outputs=[delete_all_preview_display, delete_all_execute_btn, delete_all_cancel_btn]
+    )
+    
+    preview_btn.click(
+        fn=lambda x: x,
+        inputs=[video_selector],
+        outputs=[preview_video]
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        outputs=[preview_video]
+    )
+    
+    download_btn.click(
+        fn=download_selected_video,
+        inputs=[video_selector],
+        outputs=[download_file, download_file]
+    )
+
+
+block.launch(
+    server_name=args.server,
+    server_port=args.port,
+    share=args.share,
+    inbrowser=args.inbrowser,
+    allowed_paths=[outputs_folder],
+    auth=auth_settings,
+)

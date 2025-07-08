@@ -176,3 +176,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.DS_Store
+.vscode/
+pids/
+
+# Configuration files with sensitive information
+config.env

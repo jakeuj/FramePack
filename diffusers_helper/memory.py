@@ -136,8 +136,9 @@ def offload_model_from_device_for_memory_preservation(model, target_device, pres
 
 def unload_complete_models(*args):
     for m in gpu_complete_modules + list(args):
-        m.to(device=cpu)
-        print(f'Unloaded {m.__class__.__name__} as complete.')
+        if m is not None:
+            m.to(device=cpu)
+            print(f'Unloaded {m.__class__.__name__} as complete.')
 
     gpu_complete_modules.clear()
     empty_cache()
