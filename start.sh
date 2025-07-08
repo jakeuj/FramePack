@@ -77,6 +77,31 @@ WORK_DIR="${SCRIPT_DIR}"
 
 # 載入用戶配置文件
 CONFIG_FILE="${WORK_DIR}/config.env"
+
+# 設置 Python 環境路徑
+setup_python_env() {
+    # 如果配置了 LOCAL_PYTHON，直接使用
+    if [[ -n "$LOCAL_PYTHON" ]]; then
+        PYTHON_BIN="$LOCAL_PYTHON"
+        VENV_PATH=$(dirname "$(dirname "$LOCAL_PYTHON")")
+        print_info "使用配置的 Python 解釋器: $PYTHON_BIN"
+        return 0
+    fi
+
+    # 如果配置了 LOCAL_VENV_PATH，使用該虛擬環境
+    if [[ -n "$LOCAL_VENV_PATH" ]]; then
+        VENV_PATH="$LOCAL_VENV_PATH"
+        PYTHON_BIN="${VENV_PATH}/bin/python"
+        print_info "使用配置的虛擬環境: $VENV_PATH"
+        return 0
+    fi
+
+    # 默認使用工作目錄下的 .venv
+    VENV_PATH="${WORK_DIR}/.venv"
+    PYTHON_BIN="${VENV_PATH}/bin/python"
+    print_info "使用默認虛擬環境: $VENV_PATH"
+}
+
 load_user_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         print_info "載入用戶配置文件: $CONFIG_FILE"
@@ -107,6 +132,12 @@ load_user_config() {
                 HOST)
                     HOST="$value"
                     ;;
+                LOCAL_VENV_PATH)
+                    LOCAL_VENV_PATH="$value"
+                    ;;
+                LOCAL_PYTHON)
+                    LOCAL_PYTHON="$value"
+                    ;;
                 REMOTE_HOST)
                     REMOTE_HOST="$value"
                     ;;
@@ -122,19 +153,33 @@ load_user_config() {
                 ENABLE_REMOTE)
                     ENABLE_REMOTE="$value"
                     ;;
+                FORCE_EXTERNAL_ACCESS)
+                    FORCE_EXTERNAL_ACCESS="$value"
+                    ;;
+                CUDA_VISIBLE_DEVICES)
+                    CUDA_VISIBLE_DEVICES="$value"
+                    ;;
+                ENABLE_SECOND_GPU)
+                    ENABLE_SECOND_GPU="$value"
+                    ;;
             esac
         done < "$CONFIG_FILE"
     else
         print_info "未找到用戶配置文件，將使用默認配置"
         print_info "可以創建 $CONFIG_FILE 來自定義配置"
     fi
+
+    # 載入配置後設置 Python 環境
+    setup_python_env
+
+    # 設置腳本路徑
+    SCRIPT_PATH="${WORK_DIR}/${SCRIPT_NAME}"
 }
 
-# Python 環境設置
-VENV_PATH="${WORK_DIR}/.venv"
-PYTHON_BIN="${VENV_PATH}/bin/python"
+# Python 環境設置 (可被配置文件覆蓋)
+LOCAL_VENV_PATH=""
+LOCAL_PYTHON=""
 SCRIPT_NAME="main.py"
-SCRIPT_PATH="${WORK_DIR}/${SCRIPT_NAME}"
 
 # 默認服務配置 (可被配置文件覆蓋)
 USERNAME="admin"
@@ -1086,6 +1131,14 @@ create_config_file() {
     HOST=${input_host:-0.0.0.0}
 
     echo ""
+    print_info "Python 環境配置 (可選):"
+    read -p "本地虛擬環境路徑 (留空使用默認 .venv): " input_venv_path
+    LOCAL_VENV_PATH="$input_venv_path"
+
+    read -p "本地 Python 解釋器路徑 (留空自動推導): " input_python
+    LOCAL_PYTHON="$input_python"
+
+    echo ""
     print_info "是否啟用遠端開發模式？"
     read -p "啟用遠端模式 (y/N): " -n 1 -r
     echo
@@ -1106,6 +1159,16 @@ create_config_file() {
         REMOTE_PROJECT_DIR=${input_remote_dir:-/tmp/pycharm_project_662}
     else
         ENABLE_REMOTE=false
+    fi
+
+    echo ""
+    print_info "高級配置 (可選):"
+    read -p "強制外部訪問 (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        FORCE_EXTERNAL_ACCESS=true
+    else
+        FORCE_EXTERNAL_ACCESS=false
     fi
 
     # 創建配置文件
@@ -1129,6 +1192,16 @@ SECOND_PORT=$SECOND_PORT
 HOST=$HOST
 
 # =============================================================================
+# Python 環境配置
+# =============================================================================
+
+# 本地虛擬環境路徑 (留空使用默認 .venv)
+LOCAL_VENV_PATH=$LOCAL_VENV_PATH
+
+# 本地 Python 解釋器路徑 (留空自動從虛擬環境推導)
+LOCAL_PYTHON=$LOCAL_PYTHON
+
+# =============================================================================
 # 遠端開發配置
 # =============================================================================
 
@@ -1150,6 +1223,23 @@ REMOTE_PYTHON=$REMOTE_PYTHON
 REMOTE_PROJECT_DIR=$REMOTE_PROJECT_DIR
 EOF
     fi
+
+    # 添加高級配置
+    cat >> "$CONFIG_FILE" << EOF
+
+# =============================================================================
+# 高級配置
+# =============================================================================
+
+# 強制外部訪問
+FORCE_EXTERNAL_ACCESS=$FORCE_EXTERNAL_ACCESS
+
+# GPU 設備配置 (留空自動檢測)
+CUDA_VISIBLE_DEVICES=
+
+# 第二個 GPU 服務 (留空自動檢測)
+ENABLE_SECOND_GPU=
+EOF
 
     print_success "配置文件已創建: $CONFIG_FILE"
     echo ""
@@ -1198,6 +1288,9 @@ cmd_clean() {
 
 # 顯示幫助信息
 cmd_help() {
+    # 載入用戶配置以顯示正確的配置信息
+    load_user_config
+
     echo "FramePack Service Manager - 跨平台版本"
     echo "支援 macOS (開發環境) 和 Ubuntu (部署環境)"
     echo ""
@@ -1217,8 +1310,18 @@ cmd_help() {
     echo "系統信息:"
     echo "  操作系統: $OS"
     echo "  工作目錄: $WORK_DIR"
-    echo "  Python: $PYTHON_BIN"
     echo "  腳本: $SCRIPT_NAME"
+    echo ""
+    echo "Python 環境:"
+    if [[ -n "$LOCAL_PYTHON" ]]; then
+        echo "  Python 解釋器: $LOCAL_PYTHON (配置指定)"
+    elif [[ -n "$LOCAL_VENV_PATH" ]]; then
+        echo "  虛擬環境: $LOCAL_VENV_PATH (配置指定)"
+        echo "  Python 解釋器: ${LOCAL_VENV_PATH}/bin/python"
+    else
+        echo "  虛擬環境: ${WORK_DIR}/.venv (默認)"
+        echo "  Python 解釋器: ${WORK_DIR}/.venv/bin/python"
+    fi
     echo ""
     echo "服務配置:"
     echo "  監聽地址: $HOST"
