@@ -50,8 +50,8 @@ setup_platform_env() {
         # macOS 特定環境變數 (Apple Silicon MPS 支援)
         export PYTORCH_ENABLE_MPS_FALLBACK=1
         export TOKENIZERS_PARALLELISM=false
-        # macOS 上通常使用 localhost 進行開發
-        if [[ "$HOST" == "0.0.0.0" ]] && [[ "${FORCE_EXTERNAL_ACCESS:-false}" != "true" ]]; then
+        # 如果是遠端模式，保持 0.0.0.0 以允許外部訪問
+        if [[ "$HOST" == "0.0.0.0" ]] && [[ "${FORCE_EXTERNAL_ACCESS:-false}" != "true" ]] && [[ "$ENABLE_REMOTE" != "true" ]]; then
             HOST="127.0.0.1"  # macOS 開發環境默認本機訪問
         fi
     elif [[ "$IS_UBUNTU" == true ]]; then
@@ -75,18 +75,80 @@ detect_os
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${SCRIPT_DIR}"
 
+# 載入用戶配置文件
+CONFIG_FILE="${WORK_DIR}/config.env"
+load_user_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        print_info "載入用戶配置文件: $CONFIG_FILE"
+        # 安全地載入配置文件，只允許特定變數
+        while IFS='=' read -r key value; do
+            # 跳過註釋和空行
+            [[ $key =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+
+            # 移除前後空白
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+
+            # 只允許特定的配置變數
+            case "$key" in
+                USERNAME)
+                    USERNAME="$value"
+                    ;;
+                PASSWORD)
+                    PASSWORD="$value"
+                    ;;
+                DEFAULT_PORT)
+                    DEFAULT_PORT="$value"
+                    ;;
+                SECOND_PORT)
+                    SECOND_PORT="$value"
+                    ;;
+                HOST)
+                    HOST="$value"
+                    ;;
+                REMOTE_HOST)
+                    REMOTE_HOST="$value"
+                    ;;
+                REMOTE_USER)
+                    REMOTE_USER="$value"
+                    ;;
+                REMOTE_PYTHON)
+                    REMOTE_PYTHON="$value"
+                    ;;
+                REMOTE_PROJECT_DIR)
+                    REMOTE_PROJECT_DIR="$value"
+                    ;;
+                ENABLE_REMOTE)
+                    ENABLE_REMOTE="$value"
+                    ;;
+            esac
+        done < "$CONFIG_FILE"
+    else
+        print_info "未找到用戶配置文件，將使用默認配置"
+        print_info "可以創建 $CONFIG_FILE 來自定義配置"
+    fi
+}
+
 # Python 環境設置
 VENV_PATH="${WORK_DIR}/.venv"
 PYTHON_BIN="${VENV_PATH}/bin/python"
 SCRIPT_NAME="main.py"
 SCRIPT_PATH="${WORK_DIR}/${SCRIPT_NAME}"
 
-# 服務配置
+# 默認服務配置 (可被配置文件覆蓋)
 USERNAME="admin"
 PASSWORD="123456"
 DEFAULT_PORT=7860
 SECOND_PORT=7861
 HOST="0.0.0.0"  # 監聽所有網路介面，允許外部訪問
+
+# 遠端開發配置 (可被配置文件覆蓋)
+ENABLE_REMOTE=false
+REMOTE_HOST="192.168.1.104"
+REMOTE_USER="jake"
+REMOTE_PYTHON="/home/jake/.virtualenvs/FramePackB/bin/python"
+REMOTE_PROJECT_DIR="/tmp/pycharm_project_662"
 
 # 系統配置
 PID_DIR="${WORK_DIR}/pids"
@@ -161,11 +223,26 @@ detect_gpus() {
 check_dependencies() {
     print_info "檢查系統依賴..."
 
-    # 檢查 Python 虛擬環境
-    if [[ ! -f "$PYTHON_BIN" ]]; then
-        print_error "Python 虛擬環境不存在: $PYTHON_BIN"
-        print_info "請先創建虛擬環境: python3 -m venv $VENV_PATH"
-        exit 1
+    # 如果是遠端模式，跳過本地 Python 環境檢查
+    if [[ "$ENABLE_REMOTE" == "true" ]]; then
+        print_info "遠端模式：跳過本地 Python 環境檢查"
+
+        # 檢查 SSH 連接
+        if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_USER@$REMOTE_HOST" exit 2>/dev/null; then
+            print_error "無法連接到遠端主機: $REMOTE_USER@$REMOTE_HOST"
+            print_info "請確保 SSH 免密登錄已設置"
+            exit 1
+        fi
+        print_success "遠端 SSH 連接正常"
+
+    else
+        # 檢查本地 Python 虛擬環境
+        if [[ ! -f "$PYTHON_BIN" ]]; then
+            print_error "Python 虛擬環境不存在: $PYTHON_BIN"
+            print_info "請先創建虛擬環境: python3 -m venv $VENV_PATH"
+            exit 1
+        fi
+        print_success "本地 Python 環境正常"
     fi
 
     # 檢查腳本文件
@@ -182,8 +259,13 @@ check_network() {
     print_info "檢查網路設定..."
 
     if [[ "$HOST" == "0.0.0.0" ]]; then
-        # 獲取本機 IP 地址
-        local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null)
+        # 獲取本機 IP 地址 (跨平台兼容)
+        if [[ "$IS_MACOS" == true ]]; then
+            local_ip=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | head -1)
+        else
+            local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null)
+        fi
+
         if [[ -n "$local_ip" ]]; then
             print_success "本機 IP 地址: $local_ip"
             print_info "外部設備可通過此 IP 訪問服務"
@@ -248,9 +330,15 @@ is_port_in_use() {
 # 檢查進程是否存在
 is_process_running() {
     local pid=$1
+    # 檢查輸入是否為空
+    [[ -z "$pid" ]] && return 1
+
     # 清理 PID 並檢查是否為有效數字
-    pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]*')
-    [[ -n "$pid" ]] && [[ "$pid" -gt 0 ]] 2>/dev/null && kill -0 "$pid" 2>/dev/null
+    local clean_pid
+    clean_pid=$(echo "$pid" | tr -d '\r\n\t ' | grep -o '[0-9]*')
+
+    # 檢查清理後的 PID 是否有效
+    [[ -n "$clean_pid" ]] && [[ "$clean_pid" -gt 0 ]] 2>/dev/null && kill -0 "$clean_pid" 2>/dev/null
 }
 
 # 從 PID 文件獲取 PID
@@ -350,6 +438,24 @@ start_instance() {
 
     print_info "啟動 GPU $gpu_id / Port $port 服務..."
 
+    # 根據是否啟用遠端模式選擇啟動方式
+    if [[ "$ENABLE_REMOTE" == "true" ]]; then
+        start_remote_instance "$gpu_id" "$port" "$username" "$password" "$pid_file" "$log_file" "$lock_file"
+    else
+        start_local_instance "$gpu_id" "$port" "$username" "$password" "$pid_file" "$log_file" "$lock_file"
+    fi
+}
+
+# 啟動本地服務實例
+start_local_instance() {
+    local gpu_id=$1
+    local port=$2
+    local username=$3
+    local password=$4
+    local pid_file=$5
+    local log_file=$6
+    local lock_file=$7
+
     # 設置環境變數
     export CUDA_VISIBLE_DEVICES=$gpu_id
     export PYTORCH_ENABLE_MPS_FALLBACK=1
@@ -399,6 +505,78 @@ start_instance() {
     fi
 }
 
+# 啟動遠端服務實例
+start_remote_instance() {
+    local gpu_id=$1
+    local port=$2
+    local username=$3
+    local password=$4
+    local pid_file=$5
+    local log_file=$6
+    local lock_file=$7
+
+    print_info "使用遠端模式啟動服務..."
+    print_info "遠端主機: $REMOTE_USER@$REMOTE_HOST"
+    print_info "遠端項目目錄: $REMOTE_PROJECT_DIR"
+    print_info "遠端 Python: $REMOTE_PYTHON"
+
+    # 構建遠端命令
+    local remote_cmd="cd $REMOTE_PROJECT_DIR && CUDA_VISIBLE_DEVICES=$gpu_id TOKENIZERS_PARALLELISM=false $REMOTE_PYTHON $SCRIPT_NAME --port $port --server $HOST --username $username --password $password"
+
+    # 啟動遠端服務
+    ssh "$REMOTE_USER@$REMOTE_HOST" "$remote_cmd" > "$log_file" 2>&1 &
+    local raw_pid=$!
+
+    # 清理 PID 變數中的任何不可見字符
+    local pid
+    pid=$(echo "$raw_pid" | tr -d '\r\n\t ' | sed 's/[^0-9]//g')
+
+    # 檢查 PID 是否有效
+    if [[ -z "$pid" ]] || [[ "$pid" -eq 0 ]] 2>/dev/null; then
+        print_error "無法獲取有效的進程 PID (原始: '$raw_pid', 清理後: '$pid')"
+        rm -f "$lock_file"
+        return 1
+    fi
+
+    # 保存 PID (這是本地 SSH 進程的 PID)
+    echo "$pid" > "$pid_file"
+
+    # 清理鎖文件
+    rm -f "$lock_file"
+
+    # 等待服務啟動 - 遠端啟動需要更長時間
+    print_info "等待遠端服務啟動 (模型加載中...)..."
+
+    # 等待遠端服務啟動，檢查端口是否可用
+    local max_attempts=30
+    local attempt=0
+    local service_started=false
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        if ssh -o ConnectTimeout=5 "$REMOTE_USER@$REMOTE_HOST" "lsof -i :$port" >/dev/null 2>&1; then
+            service_started=true
+            break
+        fi
+        sleep 2
+        ((attempt++))
+        if [[ $((attempt % 5)) -eq 0 ]]; then
+            print_info "等待中... ($attempt/$max_attempts)"
+        fi
+    done
+
+    if [[ "$service_started" == "true" ]]; then
+        print_success "遠端 GPU $gpu_id 服務已啟動，端口=$port"
+        print_info "日誌文件: $log_file"
+        print_info "遠端服務正在加載模型，請稍候..."
+        return 0
+    else
+        print_error "遠端 GPU $gpu_id 服務啟動失敗或超時"
+        print_info "請檢查日誌文件: $log_file"
+        rm -f "$pid_file"
+        return 1
+    fi
+}
+
 # 停止單個服務實例
 stop_instance() {
     local port=$1
@@ -407,33 +585,84 @@ stop_instance() {
 
     pid_file=$(get_pid_file "$port")
 
-    if ! pid=$(get_pid_from_file "$pid_file"); then
-        print_warning "端口 $port 的服務未在運行"
-        return 0
-    fi
+    # 如果是遠端模式，停止遠端服務
+    if [[ "$ENABLE_REMOTE" == "true" ]]; then
+        # 檢查遠端是否有服務在運行
+        if ! ssh -o ConnectTimeout=5 "$REMOTE_USER@$REMOTE_HOST" "lsof -i :$port" >/dev/null 2>&1; then
+            print_warning "端口 $port 的遠端服務未在運行"
+            return 0
+        fi
 
-    print_info "停止端口 $port 的服務 (PID: $pid)..."
+        # 獲取遠端進程 PID
+        local remote_pid
+        remote_pid=$(ssh "$REMOTE_USER@$REMOTE_HOST" "lsof -i :$port -t" 2>/dev/null | head -1)
 
-    # 嘗試優雅停止
-    kill -TERM "$pid" 2>/dev/null || true
+        if [[ -n "$remote_pid" ]]; then
+            print_info "停止遠端端口 $port 的服務 (遠端 PID: $remote_pid)..."
 
-    if wait_for_process_stop "$pid" 10; then
-        print_success "服務已優雅停止"
-    else
-        print_warning "優雅停止超時，強制終止..."
-        force_kill_process "$pid"
+            # 嘗試優雅停止遠端進程
+            ssh "$REMOTE_USER@$REMOTE_HOST" "kill -TERM $remote_pid" 2>/dev/null || true
 
-        if wait_for_process_stop "$pid" 5; then
-            print_success "服務已強制停止"
+            # 等待遠端進程停止
+            local max_wait=10
+            local count=0
+            while [[ $count -lt $max_wait ]]; do
+                if ! ssh "$REMOTE_USER@$REMOTE_HOST" "kill -0 $remote_pid" >/dev/null 2>&1; then
+                    print_success "遠端服務已優雅停止"
+                    rm -f "$pid_file"
+                    return 0
+                fi
+                sleep 1
+                ((count++))
+            done
+
+            # 強制停止
+            print_warning "優雅停止超時，強制終止遠端進程..."
+            ssh "$REMOTE_USER@$REMOTE_HOST" "kill -9 $remote_pid" 2>/dev/null || true
+            sleep 2
+
+            if ! ssh "$REMOTE_USER@$REMOTE_HOST" "kill -0 $remote_pid" >/dev/null 2>&1; then
+                print_success "遠端服務已強制停止"
+                rm -f "$pid_file"
+                return 0
+            else
+                print_error "無法停止遠端服務"
+                return 1
+            fi
         else
-            print_error "無法停止服務"
+            print_warning "無法獲取遠端進程 PID"
             return 1
         fi
-    fi
+    else
+        # 本地模式停止
+        if ! pid=$(get_pid_from_file "$pid_file"); then
+            print_warning "端口 $port 的服務未在運行"
+            return 0
+        fi
 
-    # 清理文件
-    rm -f "$pid_file"
-    return 0
+        print_info "停止端口 $port 的服務 (PID: $pid)..."
+
+        # 嘗試優雅停止
+        kill -TERM "$pid" 2>/dev/null || true
+
+        if wait_for_process_stop "$pid" 10; then
+            print_success "服務已優雅停止"
+        else
+            print_warning "優雅停止超時，強制終止..."
+            force_kill_process "$pid"
+
+            if wait_for_process_stop "$pid" 5; then
+                print_success "服務已強制停止"
+            else
+                print_error "無法停止服務"
+                return 1
+            fi
+        fi
+
+        # 清理文件
+        rm -f "$pid_file"
+        return 0
+    fi
 }
 
 # 檢查服務狀態
@@ -444,34 +673,65 @@ check_instance_status() {
 
     pid_file=$(get_pid_file "$port")
 
-    if pid=$(get_pid_from_file "$pid_file"); then
-        local cpu_usage
-        local mem_usage
-        local start_time
+    # 如果是遠端模式，檢查遠端端口狀態
+    if [[ "$ENABLE_REMOTE" == "true" ]]; then
+        if ssh -o ConnectTimeout=5 "$REMOTE_USER@$REMOTE_HOST" "lsof -i :$port" >/dev/null 2>&1; then
+            # 獲取遠端進程信息
+            local remote_pid
+            remote_pid=$(ssh "$REMOTE_USER@$REMOTE_HOST" "lsof -i :$port -t" 2>/dev/null | head -1)
 
-        # 獲取進程信息
-        if command -v ps >/dev/null 2>&1; then
-            cpu_usage=$(ps -p "$pid" -o %cpu --no-headers 2>/dev/null | tr -d ' ' || echo "N/A")
-            mem_usage=$(ps -p "$pid" -o %mem --no-headers 2>/dev/null | tr -d ' ' || echo "N/A")
-            start_time=$(ps -p "$pid" -o lstart --no-headers 2>/dev/null || echo "N/A")
-        fi
+            print_success "端口 $port: 遠端運行中 (遠端 PID: $remote_pid)"
+            echo "  遠端主機: $REMOTE_HOST"
 
-        print_success "端口 $port: 運行中 (PID: $pid)"
-        [[ "$cpu_usage" != "N/A" ]] && echo "  CPU: ${cpu_usage}%"
-        [[ "$mem_usage" != "N/A" ]] && echo "  記憶體: ${mem_usage}%"
-        [[ "$start_time" != "N/A" ]] && echo "  啟動時間: $start_time"
+            # 獲取遠端進程詳細信息
+            if [[ -n "$remote_pid" ]]; then
+                local cpu_usage mem_usage start_time
+                cpu_usage=$(ssh "$REMOTE_USER@$REMOTE_HOST" "ps -p $remote_pid -o %cpu --no-headers 2>/dev/null | tr -d ' '" || echo "N/A")
+                mem_usage=$(ssh "$REMOTE_USER@$REMOTE_HOST" "ps -p $remote_pid -o %mem --no-headers 2>/dev/null | tr -d ' '" || echo "N/A")
+                start_time=$(ssh "$REMOTE_USER@$REMOTE_HOST" "ps -p $remote_pid -o lstart --no-headers 2>/dev/null" || echo "N/A")
 
-        # 檢查端口狀態
-        if is_port_in_use "$port"; then
+                [[ "$cpu_usage" != "N/A" ]] && echo "  CPU: ${cpu_usage}%"
+                [[ "$mem_usage" != "N/A" ]] && echo "  記憶體: ${mem_usage}%"
+                [[ "$start_time" != "N/A" ]] && echo "  啟動時間: $start_time"
+            fi
+
             echo "  端口狀態: 監聽中"
+            return 0
         else
-            echo "  端口狀態: 未監聽"
+            print_warning "端口 $port: 遠端未運行"
+            return 1
         fi
-
-        return 0
     else
-        print_warning "端口 $port: 未運行"
-        return 1
+        # 本地模式檢查
+        if pid=$(get_pid_from_file "$pid_file"); then
+            local cpu_usage
+            local mem_usage
+            local start_time
+
+            # 獲取進程信息
+            if command -v ps >/dev/null 2>&1; then
+                cpu_usage=$(ps -p "$pid" -o %cpu --no-headers 2>/dev/null | tr -d ' ' || echo "N/A")
+                mem_usage=$(ps -p "$pid" -o %mem --no-headers 2>/dev/null | tr -d ' ' || echo "N/A")
+                start_time=$(ps -p "$pid" -o lstart --no-headers 2>/dev/null || echo "N/A")
+            fi
+
+            print_success "端口 $port: 運行中 (PID: $pid)"
+            [[ "$cpu_usage" != "N/A" ]] && echo "  CPU: ${cpu_usage}%"
+            [[ "$mem_usage" != "N/A" ]] && echo "  記憶體: ${mem_usage}%"
+            [[ "$start_time" != "N/A" ]] && echo "  啟動時間: $start_time"
+
+            # 檢查端口狀態
+            if is_port_in_use "$port"; then
+                echo "  端口狀態: 監聽中"
+            else
+                echo "  端口狀態: 未監聽"
+            fi
+
+            return 0
+        else
+            print_warning "端口 $port: 未運行"
+            return 1
+        fi
     fi
 }
 # =============================================================================
@@ -482,10 +742,22 @@ check_instance_status() {
 cmd_start() {
     print_info "啟動 FramePack 服務..."
 
+    # 載入用戶配置
+    load_user_config
+
     create_directories
     setup_platform_env
     check_dependencies
-    detect_gpus
+
+    # 如果啟用遠端模式，跳過本地 GPU 檢測
+    if [[ "$ENABLE_REMOTE" != "true" ]]; then
+        detect_gpus
+    else
+        print_info "遠端模式已啟用，跳過本地 GPU 檢測"
+        GPU_DEVICES=(0)  # 遠端模式使用默認 GPU 設備
+        ENABLE_SECOND_GPU=false
+    fi
+
     check_network
 
     local success=true
@@ -514,12 +786,28 @@ cmd_start() {
         echo ""
         print_info "訪問地址:"
         if [[ "$HOST" == "0.0.0.0" ]]; then
-            local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "YOUR_IP")
-            echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://localhost:$DEFAULT_PORT (本機)"
-            echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://$local_ip:$DEFAULT_PORT (外部訪問)"
-            if [[ "$ENABLE_SECOND_GPU" == "true" ]] && [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
-                echo "  第二服務 (GPU ${GPU_DEVICES[1]}): http://localhost:$SECOND_PORT (本機)"
-                echo "  第二服務 (GPU ${GPU_DEVICES[1]}): http://$local_ip:$SECOND_PORT (外部訪問)"
+            # 獲取本機 IP 地址 (跨平台兼容)
+            if [[ "$IS_MACOS" == true ]]; then
+                local_ip=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | head -1)
+            else
+                local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null)
+            fi
+            [[ -z "$local_ip" ]] && local_ip="YOUR_IP"
+
+            if [[ "$ENABLE_REMOTE" == "true" ]]; then
+                echo "  遠端服務 (GPU ${GPU_DEVICES[0]}): http://localhost:$DEFAULT_PORT (本機)"
+                echo "  遠端服務 (GPU ${GPU_DEVICES[0]}): http://$REMOTE_HOST:$DEFAULT_PORT (遠端訪問)"
+                if [[ "$ENABLE_SECOND_GPU" == "true" ]] && [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
+                    echo "  第二遠端服務 (GPU ${GPU_DEVICES[1]}): http://localhost:$SECOND_PORT (本機)"
+                    echo "  第二遠端服務 (GPU ${GPU_DEVICES[1]}): http://$REMOTE_HOST:$SECOND_PORT (遠端訪問)"
+                fi
+            else
+                echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://localhost:$DEFAULT_PORT (本機)"
+                echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://$local_ip:$DEFAULT_PORT (外部訪問)"
+                if [[ "$ENABLE_SECOND_GPU" == "true" ]] && [[ ${#GPU_DEVICES[@]} -gt 1 ]]; then
+                    echo "  第二服務 (GPU ${GPU_DEVICES[1]}): http://localhost:$SECOND_PORT (本機)"
+                    echo "  第二服務 (GPU ${GPU_DEVICES[1]}): http://$local_ip:$SECOND_PORT (外部訪問)"
+                fi
             fi
         else
             echo "  主服務 (GPU ${GPU_DEVICES[0]}): http://$HOST:$DEFAULT_PORT"
@@ -539,6 +827,9 @@ cmd_start() {
 
 # 停止所有服務
 cmd_stop() {
+    # 載入用戶配置
+    load_user_config
+
     print_info "停止 FramePack 服務..."
 
     local success=true
@@ -571,6 +862,9 @@ cmd_restart() {
 
 # 檢查服務狀態
 cmd_status() {
+    # 載入用戶配置
+    load_user_config
+
     print_info "FramePack 服務狀態:"
     echo ""
 
@@ -592,15 +886,29 @@ cmd_status() {
 
     if [[ "$any_running" == "true" ]]; then
         print_info "系統資源使用情況:"
-        if command -v free >/dev/null 2>&1; then
-            echo "記憶體使用:"
-            free -h | head -2
-        fi
+        if [[ "$ENABLE_REMOTE" == "true" ]]; then
+            print_info "遠端模式 - 檢查遠端主機資源: $REMOTE_HOST"
+            if ssh -o ConnectTimeout=5 "$REMOTE_USER@$REMOTE_HOST" "command -v free" >/dev/null 2>&1; then
+                echo "遠端記憶體使用:"
+                ssh "$REMOTE_USER@$REMOTE_HOST" "free -h | head -2"
+            fi
 
-        if command -v nvidia-smi >/dev/null 2>&1; then
-            echo ""
-            echo "GPU 使用情況:"
-            nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+            if ssh -o ConnectTimeout=5 "$REMOTE_USER@$REMOTE_HOST" "command -v nvidia-smi" >/dev/null 2>&1; then
+                echo ""
+                echo "遠端 GPU 使用情況:"
+                ssh "$REMOTE_USER@$REMOTE_HOST" "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits"
+            fi
+        else
+            if command -v free >/dev/null 2>&1; then
+                echo "記憶體使用:"
+                free -h | head -2
+            fi
+
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                echo ""
+                echo "GPU 使用情況:"
+                nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+            fi
         fi
     else
         print_warning "沒有服務在運行"
@@ -696,6 +1004,159 @@ cmd_gpu_info() {
     fi
 }
 
+# 配置管理
+cmd_config() {
+    print_info "FramePack 配置管理"
+    echo ""
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        print_success "發現現有配置文件: $CONFIG_FILE"
+        echo ""
+        print_info "當前配置內容:"
+        cat "$CONFIG_FILE"
+        echo ""
+
+        print_info "請選擇操作:"
+        echo "1) 編輯現有配置"
+        echo "2) 重新創建配置"
+        echo "3) 刪除配置文件"
+        echo "4) 返回"
+
+        read -p "請輸入選項 (1-4): " choice
+
+        case $choice in
+            1)
+                if command -v nano >/dev/null 2>&1; then
+                    nano "$CONFIG_FILE"
+                elif command -v vi >/dev/null 2>&1; then
+                    vi "$CONFIG_FILE"
+                else
+                    print_error "未找到文本編輯器 (nano/vi)"
+                    return 1
+                fi
+                ;;
+            2)
+                create_config_file
+                ;;
+            3)
+                read -p "確定要刪除配置文件嗎？(y/N): " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    rm -f "$CONFIG_FILE"
+                    print_success "配置文件已刪除"
+                else
+                    print_info "已取消"
+                fi
+                ;;
+            4)
+                return 0
+                ;;
+            *)
+                print_error "無效選項"
+                return 1
+                ;;
+        esac
+    else
+        print_info "未找到配置文件，將創建新的配置文件"
+        create_config_file
+    fi
+}
+
+# 創建配置文件
+create_config_file() {
+    print_info "創建新的配置文件..."
+
+    # 詢問用戶配置選項
+    echo ""
+    print_info "請輸入配置信息 (直接按 Enter 使用默認值):"
+
+    read -p "認證用戶名 [admin]: " input_username
+    USERNAME=${input_username:-admin}
+
+    read -p "認證密碼 [123456]: " input_password
+    PASSWORD=${input_password:-123456}
+
+    read -p "主端口 [7860]: " input_port
+    DEFAULT_PORT=${input_port:-7860}
+
+    read -p "第二端口 [7861]: " input_second_port
+    SECOND_PORT=${input_second_port:-7861}
+
+    read -p "監聽地址 [0.0.0.0]: " input_host
+    HOST=${input_host:-0.0.0.0}
+
+    echo ""
+    print_info "是否啟用遠端開發模式？"
+    read -p "啟用遠端模式 (y/N): " -n 1 -r
+    echo
+
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        ENABLE_REMOTE=true
+
+        read -p "遠端主機 IP [192.168.1.104]: " input_remote_host
+        REMOTE_HOST=${input_remote_host:-192.168.1.104}
+
+        read -p "遠端用戶名 [jake]: " input_remote_user
+        REMOTE_USER=${input_remote_user:-jake}
+
+        read -p "遠端 Python 路徑 [/home/jake/.virtualenvs/FramePackB/bin/python]: " input_remote_python
+        REMOTE_PYTHON=${input_remote_python:-/home/jake/.virtualenvs/FramePackB/bin/python}
+
+        read -p "遠端項目目錄 [/tmp/pycharm_project_662]: " input_remote_dir
+        REMOTE_PROJECT_DIR=${input_remote_dir:-/tmp/pycharm_project_662}
+    else
+        ENABLE_REMOTE=false
+    fi
+
+    # 創建配置文件
+    cat > "$CONFIG_FILE" << EOF
+# FramePack 用戶配置文件
+# 由配置管理工具自動生成
+
+# =============================================================================
+# 服務配置
+# =============================================================================
+
+# 認證設定
+USERNAME=$USERNAME
+PASSWORD=$PASSWORD
+
+# 端口設定
+DEFAULT_PORT=$DEFAULT_PORT
+SECOND_PORT=$SECOND_PORT
+
+# 服務器監聽地址
+HOST=$HOST
+
+# =============================================================================
+# 遠端開發配置
+# =============================================================================
+
+# 是否啟用遠端模式
+ENABLE_REMOTE=$ENABLE_REMOTE
+EOF
+
+    if [[ "$ENABLE_REMOTE" == "true" ]]; then
+        cat >> "$CONFIG_FILE" << EOF
+
+# 遠端服務器設定
+REMOTE_HOST=$REMOTE_HOST
+REMOTE_USER=$REMOTE_USER
+
+# 遠端 Python 環境路徑
+REMOTE_PYTHON=$REMOTE_PYTHON
+
+# 遠端項目目錄
+REMOTE_PROJECT_DIR=$REMOTE_PROJECT_DIR
+EOF
+    fi
+
+    print_success "配置文件已創建: $CONFIG_FILE"
+    echo ""
+    print_info "配置內容:"
+    cat "$CONFIG_FILE"
+}
+
 # 清理系統文件
 cmd_clean() {
     print_info "清理 FramePack 系統文件..."
@@ -749,6 +1210,7 @@ cmd_help() {
     echo "  status    檢查服務狀態"
     echo "  dev       開發模式 (互動式選擇)"
     echo "  gpu       顯示 GPU 信息"
+    echo "  config    配置管理 (創建/編輯配置文件)"
     echo "  clean     清理系統文件 (PID 文件、鎖文件等)"
     echo "  help      顯示此幫助信息"
     echo ""
@@ -762,13 +1224,29 @@ cmd_help() {
     echo "  監聽地址: $HOST"
     echo "  主端口: $DEFAULT_PORT"
     echo "  第二端口: $SECOND_PORT"
-    echo "  GPU 自動偵測: 啟用"
-    if [[ ${#GPU_DEVICES[@]} -gt 0 ]]; then
-        echo "  檢測到的 GPU: ${GPU_DEVICES[*]}"
-        echo "  第二個 GPU 服務: $([ "$ENABLE_SECOND_GPU" = true ] && echo "自動啟用" || echo "未啟用")"
+    echo "  認證用戶名: $USERNAME"
+    echo "  認證密碼: $PASSWORD"
+    echo ""
+    echo "運行模式:"
+    if [[ "$ENABLE_REMOTE" == "true" ]]; then
+        echo "  模式: 遠端開發模式"
+        echo "  遠端主機: $REMOTE_USER@$REMOTE_HOST"
+        echo "  遠端 Python: $REMOTE_PYTHON"
+        echo "  遠端項目目錄: $REMOTE_PROJECT_DIR"
     else
-        echo "  GPU 狀態: 將在啟動時自動偵測"
+        echo "  模式: 本地模式"
+        echo "  GPU 自動偵測: 啟用"
+        if [[ ${#GPU_DEVICES[@]} -gt 0 ]]; then
+            echo "  檢測到的 GPU: ${GPU_DEVICES[*]}"
+            echo "  第二個 GPU 服務: $([ "$ENABLE_SECOND_GPU" = true ] && echo "自動啟用" || echo "未啟用")"
+        else
+            echo "  GPU 狀態: 將在啟動時自動偵測"
+        fi
     fi
+    echo ""
+    echo "配置文件:"
+    echo "  用戶配置: $CONFIG_FILE $([ -f "$CONFIG_FILE" ] && echo "(已載入)" || echo "(未找到)")"
+    echo "  示例配置: ${CONFIG_FILE}.example"
     echo ""
     echo "環境變數:"
     if [[ "$IS_MACOS" == true ]]; then
@@ -833,6 +1311,9 @@ main() {
             ;;
         gpu)
             cmd_gpu_info
+            ;;
+        config)
+            cmd_config
             ;;
         clean)
             cmd_clean
