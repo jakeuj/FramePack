@@ -449,23 +449,35 @@ class BaseVideoProcessor(ABC):
     def _create_sampling_callback(self, stream, steps: int, total_generated_latent_frames: int):
         """創建採樣回調函數"""
         def callback(d):
-            preview = d['denoised']
-            preview = vae_decode_fake(preview)
-            
-            preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
-            preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
-            
-            if stream.input_queue.top() == 'end':
+            try:
+                preview = d['denoised']
+                preview = vae_decode_fake(preview)
+
+                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
+
+                # 檢查是否需要停止
+                if stream.input_queue.top() == 'end':
+                    stream.output_queue.push(('end', None))
+                    raise KeyboardInterrupt('User ends the task.')
+
+                current_step = d['i'] + 1
+                percentage = int(100.0 * current_step / steps)
+                hint = f'Sampling {current_step}/{steps}'
+                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 24) :.2f} seconds (FPS-24). The video is being extended now ...'
+                stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+
+            except KeyboardInterrupt:
+                # 確保結束信號被發送
                 stream.output_queue.push(('end', None))
-                raise KeyboardInterrupt('User ends the task.')
-            
-            current_step = d['i'] + 1
-            percentage = int(100.0 * current_step / steps)
-            hint = f'Sampling {current_step}/{steps}'
-            desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 24) :.2f} seconds (FPS-24). The video is being extended now ...'
-            stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                raise
+            except Exception as e:
+                print(f"Error in sampling callback: {e}")
+                # 發送錯誤信息但不中斷處理
+                stream.output_queue.push(('progress', (None, f"Error: {e}", make_progress_bar_html(0, 'Error'))))
+
             return
-        
+
         return callback
     
     def _save_video(self, history_pixels, job_id: str, total_generated_latent_frames: int, mp4_crf: int):

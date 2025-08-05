@@ -51,21 +51,24 @@ class BaseApp(ABC):
         # 解析命令行參數
         args = self.config.parse_args()
         print(args)
-        
+
         # 創建輸出目錄
         self.config.create_output_dir()
-        
+
         # 初始化模型管理器
         self.model_manager = ModelManager(self.model_path)
-        
+
         # 初始化文件管理器
         self.file_manager = FileManager(self.config.output_dir)
-        
+
         # 初始化 UI 構建器
         self.ui_builder = UIBuilder(
             app_title=self.app_title,
             high_vram=self.model_manager.high_vram
         )
+
+        # 重置任何可能殘留的處理中項目
+        self.queue_manager.reset_processing_items()
         
     @abstractmethod
     def get_video_processor(self):
@@ -145,8 +148,21 @@ class BaseApp(ABC):
     
     def end_process(self):
         """結束處理"""
-        self.stream.input_queue.push('end')
+        from diffusers_helper.thread_utils import Listener
+
+        # 停止當前處理
+        if hasattr(self, 'stream') and self.stream:
+            self.stream.input_queue.push('end')
+
+        # 停止隊列處理
         self.is_processing_queue = False
+
+        # 停止所有後台任務
+        Listener.stop_all_tasks()
+
+        # 重置正在處理的項目狀態
+        if hasattr(self, 'queue_manager'):
+            self.queue_manager.reset_processing_items()
 
     def add_to_queue(self, input_image, batch_images, upload_mode, prompt, n_prompt, seed,
                      total_second_length, latent_window_size, steps, cfg, gs, rs,
@@ -240,50 +256,70 @@ class BaseApp(ABC):
 
     def process_queue(self):
         """處理隊列中的項目"""
-        while self.is_processing_queue and not self.queue_manager.is_empty():
-            # 獲取下一個項目
-            item = self.queue_manager.get_next_item()
-            if item is None:
-                break
+        try:
+            while self.is_processing_queue and not self.queue_manager.is_empty():
+                # 檢查是否需要停止
+                if not self.is_processing_queue:
+                    break
 
-            try:
-                # 創建新的 stream 用於這個項目
-                self.stream = AsyncStream()
+                # 獲取下一個項目
+                item = self.queue_manager.get_next_item()
+                if item is None:
+                    break
 
-                # 處理項目
-                self.worker(
-                    item.image, item.prompt, item.n_prompt, item.seed,
-                    item.total_second_length, item.latent_window_size, item.steps,
-                    item.cfg, item.gs, item.rs, item.gpu_memory_preservation,
-                    item.use_teacache, item.mp4_crf, item.resolution,
-                    item.lora_file, item.lora_multiplier, item.use_magcache,
-                    item.magcache_thresh, item.magcache_K, item.magcache_retention_ratio
-                )
+                try:
+                    # 創建新的 stream 用於這個項目
+                    self.stream = AsyncStream()
 
-                # 等待處理完成
-                output_filename = None
-                while True:
-                    flag, data = self.stream.output_queue.next()
+                    # 處理項目
+                    self.worker(
+                        item.image, item.prompt, item.n_prompt, item.seed,
+                        item.total_second_length, item.latent_window_size, item.steps,
+                        item.cfg, item.gs, item.rs, item.gpu_memory_preservation,
+                        item.use_teacache, item.mp4_crf, item.resolution,
+                        item.lora_file, item.lora_multiplier, item.use_magcache,
+                        item.magcache_thresh, item.magcache_K, item.magcache_retention_ratio
+                    )
 
-                    if flag == 'file':
-                        output_filename = data
+                    # 等待處理完成
+                    output_filename = None
+                    while True:
+                        # 再次檢查是否需要停止
+                        if not self.is_processing_queue:
+                            self.queue_manager.fail_item(item.id, "Processing stopped by user")
+                            break
 
-                    if flag == 'end':
-                        break
+                        flag, data = self.stream.output_queue.next()
 
-                # 標記項目完成
-                if output_filename:
-                    self.queue_manager.complete_item(item.id, output_filename)
-                else:
-                    self.queue_manager.fail_item(item.id, "No output file generated")
+                        if flag == 'file':
+                            output_filename = data
 
-            except Exception as e:
-                # 標記項目失敗
-                self.queue_manager.fail_item(item.id, str(e))
-                print(f"Error processing queue item {item.id}: {e}")
+                        if flag == 'end':
+                            break
 
-        # 隊列處理完成
-        self.is_processing_queue = False
+                    # 標記項目完成
+                    if self.is_processing_queue:  # 只有在沒有被停止的情況下才標記完成
+                        if output_filename:
+                            self.queue_manager.complete_item(item.id, output_filename)
+                        else:
+                            self.queue_manager.fail_item(item.id, "No output file generated")
+
+                except KeyboardInterrupt:
+                    # 用戶中斷處理
+                    self.queue_manager.fail_item(item.id, "Interrupted by user")
+                    print(f"Queue item {item.id} interrupted by user")
+                    break
+                except Exception as e:
+                    # 標記項目失敗
+                    self.queue_manager.fail_item(item.id, str(e))
+                    print(f"Error processing queue item {item.id}: {e}")
+                    # 繼續處理下一個項目
+
+        except Exception as e:
+            print(f"Error in queue processing: {e}")
+        finally:
+            # 隊列處理完成
+            self.is_processing_queue = False
 
     def refresh_queue(self):
         """刷新隊列狀態"""
@@ -299,8 +335,17 @@ class BaseApp(ABC):
 
     def clear_queue(self):
         """清空隊列"""
-        if not self.is_processing_queue:
-            self.queue_manager.clear_all()
+        from diffusers_helper.thread_utils import Listener
+
+        # 如果正在處理，先停止
+        if self.is_processing_queue:
+            self.is_processing_queue = False
+            Listener.stop_all_tasks()
+            # 重置正在處理的項目
+            self.queue_manager.reset_processing_items()
+
+        # 清空隊列
+        self.queue_manager.clear_all()
         return self.refresh_queue()
     
     def create_interface(self) -> gr.Blocks:

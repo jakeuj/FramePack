@@ -569,3 +569,30 @@ class ImageProcessingQueue:
             self.shared_manager._save_queue(filtered_data)
         finally:
             self.shared_manager._release_file_lock(lock_fd)
+
+    def reset_processing_items(self):
+        """重置正在處理的項目狀態為等待"""
+        if self.shared_queue:
+            self._reset_processing_items_shared()
+        else:
+            with self.lock:
+                for item in self.queue:
+                    if item.status == "processing":
+                        item.status = "waiting"
+                        item.started_at = None
+                self.current_processing = None
+
+    def _reset_processing_items_shared(self):
+        """重置共享隊列中正在處理的項目"""
+        lock_fd = self.shared_manager._get_file_lock()
+        try:
+            queue_data = self.shared_manager._load_queue()
+
+            for item in queue_data:
+                if item['status'] == 'processing':
+                    item['status'] = 'waiting'
+                    item['started_at'] = None
+
+            self.shared_manager._save_queue(queue_data)
+        finally:
+            self.shared_manager._release_file_lock(lock_fd)
