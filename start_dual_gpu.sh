@@ -6,6 +6,12 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 讀取配置文件
+CONFIG_FILE="config.env"
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+fi
+
 # 顏色定義
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -120,16 +126,22 @@ start_services() {
 
 # 顯示服務信息
 show_service_info() {
+    # 從配置文件讀取端口和登錄信息
+    local gpu0_port=${DEFAULT_PORT:-7860}
+    local gpu1_port=${SECOND_PORT:-7861}
+    local display_username=${USERNAME:-"admin"}
+    local display_password=${PASSWORD:-"123456"}
+
     echo ""
     print_success "🎉 雙 GPU 服務啟動完成！"
     echo ""
     print_info "📋 服務信息："
-    echo "  🖥️  GPU 0 服務: http://localhost:7860"
-    echo "  🖥️  GPU 1 服務: http://localhost:7861"
+    echo "  🖥️  GPU 0 服務: http://localhost:$gpu0_port"
+    echo "  🖥️  GPU 1 服務: http://localhost:$gpu1_port"
     echo ""
     print_info "🔑 登錄信息："
-    echo "  👤 用戶名: admin"
-    echo "  🔒 密碼: 123456"
+    echo "  👤 用戶名: $display_username"
+    echo "  🔒 密碼: $display_password"
     echo ""
     print_info "📊 隊列共享："
     echo "  ✅ 兩個服務共享同一個處理隊列"

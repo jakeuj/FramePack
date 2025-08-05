@@ -6,19 +6,30 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 讀取配置文件
+CONFIG_FILE="config.env"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "❌ 找不到配置文件: $CONFIG_FILE"
+    echo "請確保 config.env 文件存在並包含必要的配置信息"
+    exit 1
+fi
+
+# 載入配置文件
+source "$CONFIG_FILE"
+
 # 設定 GPU 環境變數
 export CUDA_VISIBLE_DEVICES=1
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 export TOKENIZERS_PARALLELISM=false
 
-# 設定服務參數
-PORT=7861
-USERNAME="admin"
-PASSWORD="123456"
-HOST="0.0.0.0"
+# 設定服務參數 (從配置文件讀取，如果未設定則使用默認值)
+PORT=${SECOND_PORT:-7861}
+USERNAME=${USERNAME:-"admin"}
+PASSWORD=${PASSWORD:-"123456"}
+HOST=${HOST:-"0.0.0.0"}
 
-# Python 環境設定
-PYTHON_BIN="/home/jake/.virtualenvs/FramePack/bin/python"
+# Python 環境設定 (從配置文件讀取，如果未設定則使用默認值)
+PYTHON_BIN=${LOCAL_PYTHON:-"/home/jake/.virtualenvs/FramePack/bin/python"}
 SCRIPT_NAME="main.py"
 
 # 檢查 Python 環境
