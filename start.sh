@@ -258,9 +258,9 @@ HOST="0.0.0.0"  # 監聽所有網路介面，允許外部訪問
 
 # 遠端開發配置 (可被配置文件覆蓋)
 ENABLE_REMOTE=false
-REMOTE_HOST="192.168.1.104"
-REMOTE_USER="jake"
-REMOTE_PYTHON="/home/jake/.virtualenvs/FramePackB/bin/python"
+REMOTE_HOST="192.168.1.2"
+REMOTE_USER="user"
+REMOTE_PYTHON="/home/user/.virtualenvs/FramePackB/bin/python"
 REMOTE_PROJECT_DIR="/tmp/pycharm_project_662"
 
 # 運行模式檢測 (可被配置文件或命令行參數覆蓋)
