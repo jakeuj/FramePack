@@ -2,6 +2,7 @@
 基礎應用類
 提供應用程式的基本結構和共同功能
 """
+import os
 import gradio as gr
 import numpy as np
 from abc import ABC, abstractmethod
@@ -18,7 +19,7 @@ from .queue_manager import ImageProcessingQueue
 
 class BaseApp(ABC):
     """基礎應用類"""
-    
+
     def __init__(self, model_path: str, app_title: str = "FramePack"):
         self.model_path = model_path
         self.app_title = app_title
@@ -29,7 +30,12 @@ class BaseApp(ABC):
         self.file_manager = None
         self.ui_builder = None
         self.stream = AsyncStream()
-        self.queue_manager = ImageProcessingQueue()
+
+        # 獲取 GPU ID（從環境變數或配置）
+        self.gpu_id = os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(',')[0]
+
+        # 初始化隊列管理器（支援共享隊列）
+        self.queue_manager = ImageProcessingQueue(gpu_id=self.gpu_id, shared_queue=True)
         self.is_processing_queue = False
 
         # 設置環境
@@ -294,7 +300,7 @@ class BaseApp(ABC):
     def clear_queue(self):
         """清空隊列"""
         if not self.is_processing_queue:
-            self.queue_manager.queue.clear()
+            self.queue_manager.clear_all()
         return self.refresh_queue()
     
     def create_interface(self) -> gr.Blocks:
