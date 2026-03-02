@@ -1,6 +1,6 @@
 ---
 name: framepack
-description: Guide for working with the FramePack codebase — a next-frame prediction video generation system based on HunyuanVideo. Use this skill whenever the user asks about FramePack architecture, video generation pipeline, memory management, model loading, Gradio UI, LoRA integration, TeaCache, diffusion sampling, or any code changes in this repository. Also use when the user mentions image-to-video, latent windows, VAE encoding/decoding, CLIP vision, or progressive video generation.
+description: Guide for working with the FramePack codebase — a next-frame prediction video generation system based on HunyuanVideo. Use this skill whenever the user asks about FramePack architecture, video generation pipeline, memory management, VRAM optimization, model loading, Gradio UI, LoRA integration, TeaCache, diffusion sampling, or any code changes in this repository. Also use when the user mentions image-to-video, latent windows, VAE encoding/decoding, CLIP vision, progressive video generation, GPU offload, DynamicSwap, medium_vram, high_vram, or RTX 5090/4090/3090 optimization.
 ---
 
 # FramePack 專案 Skill
@@ -51,9 +51,11 @@ FramePack/
 ### 記憶體管理（`diffusers_helper/memory.py`）
 
 - **`DynamicSwapInstaller`** — 比 HuggingFace 的 `enable_sequential_offload` 快 3 倍的動態模型搬移機制。透過 monkey-patch `__getattr__` 讓參數在存取時自動搬到 GPU
-- **`high_vram` 模式** — 超過 60GB VRAM 時全部模型常駐 GPU；低記憶體模式則動態搬移
 - **`gpu_memory_preservation`** — 使用者可設定保留的 GPU 記憶體量，避免 OOM
-- **關鍵函式**：`move_model_to_device_with_memory_preservation`、`offload_model_from_device_for_memory_preservation`、`load_model_as_complete`、`unload_complete_models`
+- **三級 VRAM 模式**：`high_vram`（>60GB，全常駐）、`medium_vram`（28-60GB，transformer+小模型常駐，text_encoder 用 DynamicSwap）、低 VRAM（≤28GB，動態 offload）
+- 模型 VRAM 合計 ~41.75 GB（transformer ~25.7GB 佔最大宗，text_encoder ~14GB 次之）
+
+> 📖 詳細的模型大小表、VRAM 模式說明、推論流程時序圖、峰值估算，請參考 `references/vram-management.md`
 
 ### Latent Window 機制
 
@@ -106,6 +108,11 @@ python demo_gradio_f1.py
 
 # 常用選項
 python demo_gradio.py --share --port 7860 --server 127.0.0.1 --inbrowser --output_dir ./outputs
+
+# RTX 5090 (32GB) 優化：手動強制啟用 medium_vram 模式
+python demo_gradio.py --medium-vram
+python demo_gradio_f1.py --medium-vram
+# 注意：VRAM > 28GB 時會自動啟用 medium_vram，通常不需要手動指定
 ```
 
 ## 支援平台
